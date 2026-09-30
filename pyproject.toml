@@ -1,0 +1,24 @@
+[project]
+name = "liuying"
+version = "0.1.0"
+description = "留影 — share-link video downloader"
+requires-python = ">=3.12"
+dependencies = [
+  "fastapi>=0.115,<1", "uvicorn[standard]>=0.34,<1",
+  "sqlalchemy>=2.0,<3", "psycopg[binary]>=3.2,<4",
+  "celery[redis]>=5.4,<6", "httpx>=0.28,<1",
+  "yt-dlp[default]>=2026.8.19", "imageio-ffmpeg>=0.6,<1",
+  "pydantic-settings>=2.7,<3", "itsdangerous>=2.2,<3", "json5>=0.10,<1",
+  "python-multipart>=0.0.9,<1"
+]
+
+[dependency-groups]
+dev = ["pytest>=8,<10", "ruff>=0.11,<1"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 110

@@ -1,0 +1,89 @@
+# path: f2/apps/twitter/crawler.py
+
+from typing import Optional
+
+from f2.apps.twitter.api import TwitterAPIEndpoints as xendpoints
+from f2.apps.twitter.model import (
+    BookmarkTweet,
+    BookmarkTweetEncode,
+    LikeTweet,
+    LikeTweetEncode,
+    PostTweet,
+    PostTweetEncode,
+    TweetDetail,
+    TweetDetailEncode,
+    UserProfile,
+    UserProfileEncode,
+    encode_model,
+)
+from f2.apps.twitter.utils import ClientConfManager, ModelManager
+from f2.crawlers.base_crawler import BaseCrawler
+from f2.i18n.translator import _
+from f2.log.logger import logger
+from f2.utils.http.cookie import parse_cookie_str
+
+
+class TwitterCrawler(BaseCrawler):
+    def __init__(
+        self,
+        kwargs: Optional[dict] = None,
+    ):
+        # 需要与cli同步
+        kwargs = kwargs or {}
+        proxies = kwargs.get("proxies", {"http://": None, "https://": None})
+        self.authorization = (
+            kwargs.get("Authorization") or ClientConfManager.authorization()
+        )
+        # X 要求 X-Csrf-Token 与 cookie 里的 ct0 一致，cookie 带有 ct0 时优先使用它，
+        # 避免配置文件里过期的值导致 403（#426，移植自 #442）
+        ct0 = parse_cookie_str(kwargs.get("cookie") or "").get("ct0")
+        self.x_csrf_token = (
+            ct0 or kwargs.get("X-Csrf-Token") or ClientConfManager.x_csrf_token()
+        )
+        self.headers = kwargs.get("headers", {}) | {
+            "Cookie": kwargs.get("cookie"),
+            "Authorization": self.authorization,
+            "X-Csrf-Token": self.x_csrf_token,
+        }
+
+        super().__init__(kwargs=kwargs, proxies=proxies, crawler_headers=self.headers)
+
+    async def fetch_tweet_detail(self, params: TweetDetailEncode):
+        endpoint = ModelManager.model_2_endpoint(
+            xendpoints.POST_DETAIL,
+            TweetDetail(variables=encode_model(params)).model_dump(),
+        )
+        logger.debug(_("推文详情接口地址: {0}").format(endpoint))
+        return await self._fetch_get_json(endpoint)
+
+    async def fetch_user_profile(self, params: UserProfileEncode):
+        endpoint = ModelManager.model_2_endpoint(
+            xendpoints.USER_PROFILE,
+            UserProfile(variables=encode_model(params)).model_dump(),
+        )
+        logger.debug(_("用户信息接口地址: {0}").format(endpoint))
+        return await self._fetch_get_json(endpoint)
+
+    async def fetch_post_tweet(self, params: PostTweetEncode):
+        endpoint = ModelManager.model_2_endpoint(
+            xendpoints.USER_POST,
+            PostTweet(variables=encode_model(params)).model_dump(),
+        )
+        logger.debug(_("主页推文接口地址: {0}").format(endpoint))
+        return await self._fetch_get_json(endpoint)
+
+    async def fetch_like_tweet(self, params: LikeTweetEncode):
+        endpoint = ModelManager.model_2_endpoint(
+            xendpoints.USER_LIKE,
+            LikeTweet(variables=encode_model(params)).model_dump(),
+        )
+        logger.debug(_("喜欢推文接口地址: {0}").format(endpoint))
+        return await self._fetch_get_json(endpoint)
+
+    async def fetch_bookmark_tweet(self, params: BookmarkTweetEncode):
+        endpoint = ModelManager.model_2_endpoint(
+            xendpoints.USER_BOOKMARK,
+            BookmarkTweet(variables=encode_model(params)).model_dump(),
+        )
+        logger.debug(_("书签(收藏)推文接口地址: {0}").format(endpoint))
+        return await self._fetch_get_json(endpoint)

@@ -1,0 +1,65 @@
+# Local production-style topology. No database/Redis port is exposed to the host.
+name: liuying
+x-app: &app
+  build: .
+  environment: &env
+    LIUYING_DATA_DIR: /data
+    LIUYING_DATABASE_URL: postgresql+psycopg://liuying:${LIUYING_DB_PASSWORD:-liuying-local-only}@db:5432/liuying
+    LIUYING_QUEUE_MODE: celery
+    LIUYING_REDIS_URL: redis://redis:6379/0
+    LIUYING_DTK_URL: ${LIUYING_DTK_URL:-}
+    LIUYING_DTK_API_KEY: ${LIUYING_DTK_API_KEY:-}
+    LIUYING_ALLOWED_HOSTS: '["127.0.0.1","localhost"]'
+  volumes:
+    - media:/data
+  restart: unless-stopped
+  depends_on:
+    db:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+
+services:
+  api:
+    <<: *app
+    ports:
+      - "127.0.0.1:8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+  worker:
+    <<: *app
+    command: ["celery", "-A", "api.celery_app:app", "worker", "--loglevel=INFO", "--concurrency=2"]
+    depends_on:
+      api:
+        condition: service_healthy
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: liuying
+      POSTGRES_PASSWORD: ${LIUYING_DB_PASSWORD:-liuying-local-only}
+      POSTGRES_DB: liuying
+    volumes:
+      - database:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U liuying"]
+      interval: 5s
+      retries: 10
+    restart: unless-stopped
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - queue:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      retries: 10
+    restart: unless-stopped
+
+volumes:
+  media:
+  database:
+  queue:

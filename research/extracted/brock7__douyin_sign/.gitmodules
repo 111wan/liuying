@@ -1,0 +1,3 @@
+[submodule "douyin_sign"]
+	path = douyin_sign
+	url = https://github.com/brock7/douyin_sign

@@ -1,0 +1,690 @@
+# Changelog
+
+本项目的所有变更都将记录在此文件中。
+格式基于 [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)、
+本项目遵循 [Semantic Versioning](https://semver.org/spec/v2.0.0.html)。
+
+## [Unreleased]
+
+- 修复 twitter 主页推文与书签在一页只有一个条目时崩溃的问题：`jsonpath_ng` 对超出列表长度的负数下标（如只有 1 项时取 `[-2]`）会抛出 `IndexError`，`min_cursor` 因此报错，连带 `_to_list`、`_to_dict` 失败。`JSONModel` 的查询现在把这种情况视为字段缺失，所有平台的过滤器都受益。
+- 抖音按分辨率与码率选择最高清晰度（#214）：此前固定取清晰度列表的第一项，而接口按码率排序，2K、4K 只有 H.265 版本时码率可能低于 1080p 的 H.264，会下载到 1080p。现在先比较分辨率、再比较码率，清晰度列表为空时改用 `video.play_addr`；普通作品下载的文件不变。新增 `select_best_bit_rate`、`get_video_play_urls`。最高清晰度可能只有 H.265 编码，FAQ 已说明。
+- 抖音作品被删除或设为私密时，报错给出接口返回的原因（如“因作品权限或已被删除，无法观看”），不再提示“动图作品接口正在维护中”。
+- `--auto-cookie` 读取 Chrome、Edge 失败时给出原因与解决办法（#193、#205）：Windows 上的新版 Chrome、Edge 改用了应用绑定加密，`browser_cookie3`（0.20.1，目前的最新版）还不能解密。报错 `Unable to get key for cookie decryption` 时现在会提示改用 `--auto-cookie firefox` 或手动复制 cookie，并附上 FAQ 链接；cookie 数据库被占用时提示关闭浏览器后重试。FAQ 新增对应条目，各应用的 `--auto-cookie` 说明链接到它。新增 `f2.utils.http.browser.explain_browser_error`。
+- 修复 `--auto-cookie` 获取失败时退出码仍为 `0` 的问题：`finally` 中的 `ctx.exit(0)` 会覆盖失败时的 `abort`。现在读取浏览器失败、没有取到 cookie 或权限不足时输出原因并以退出码 `1` 结束，确认更新配置时被取消（如输入已结束）同样以 `1` 结束；获取成功或选择不更新配置时仍为 `0`。
+- 没有提供 cookie 时抛出 `ConfError`，只报一行错误：此前抖音、TikTok、twitter、微博的下载器抛出 `ValueError`（`kwargs` 里没有 `cookie` 时是 `KeyError`），会打印完整堆栈。只检查是否提供了 cookie，空字符串仍然允许，因为抖音直播等请求不需要用户的 cookie；通过 CLI 运行时，配置里空的 cookie 是空字符串，所以主要影响作为库使用的场景。微博的提示文字与其他应用统一。
+- 修复作者改名后另建文件夹、重新下载全部作品的问题：此前 `create_or_rename_user_folder` 先按新名称建目录，再把新目录「重命名」为它自己，旧目录从不搬动。现在名称变化时，把各下载模式下旧名称的目录一起重命名为新名称，已下载的作品随目录保留；某个模式下新名称的目录已存在时，该模式的两个目录都保持不变，不覆盖也不合并，并在日志中提示；重命名失败（例如目录中的文件正被占用）时当前模式本次继续使用旧目录。各模式的旧目录都改名后，数据库中的名称更新为新名称（此前从不更新），作者以后再改名也能继续跟随；还有冲突或改名失败的旧目录时保留旧名称，下次运行继续处理。抖音、推特、微博按昵称，TikTok 按用户名（`uniqueId`）；TikTok 单个作品与直播模式按新用户名查不到本地记录时改按 `secUid` 查找。#248 调整文件名规则后很多作者的文件夹名会变化，升级后旧文件夹会在下次下载时自动改为新名称，不再另建文件夹（文件名变化的作品仍会按新名称重新下载一次）。新增 `f2.utils.file.path.get_user_folder_path`、`migrate_user_folder`、`migrate_user_folders` 与 `is_user_folder_migrated`；微博 `AsyncUserDB` 新增拼写正确的 `update_user_info`（`updat_user_info` 仍可使用）。
+- 抖音、TikTok、twitter 的日期区间格式错误或结束日期早于开始日期时，在发起请求前以一行错误退出（退出码 `1`）。此前只记一条日志：主页等模式会翻完全部页面，却因筛选失败一个作品都不下载，并且每页重复报错。校验在创建下载器时进行，作为库使用时同样生效；主页作品的翻页游标改用 `parse_interval` 计算，结果不变。
+- 配置错误中的配置项名称不再被日志脱敏打码：`ConfError` 的标签由 `Key` 改为 `Setting`（此前 `Key: interval` 会被当成密钥显示为 `Key: ***`）；`cookie`、`key`、`token` 等敏感配置项的值在异常文本中直接打码，此前被打码的只是键名，`Value` 中的值反而原样输出。`InvalidConfError`、`InvalidEncodingError` 的配置项与值改由 `ConfError` 统一追加。
+- 配置文件出错时只输出一行错误：`-c` 指定的配置文件无法解析时不再抛出 `RuntimeError` 并打印完整堆栈，而是给出出错的行号、列号与文件路径；文件不是 UTF-8 编码、顶层不是键值映射（此前抛出 `AttributeError`）或没有该应用的配置（此前抛出 `ValueError`）时同样只报一行，并以退出码 `1` 结束，缺少应用配置时提示可以用 `--init-config` 补充。用户级 `conf.yaml` 与 `--init-config` 遇到的解析错误也改为同样的一行格式。新增 `ConfigManager.get_app_config`。
+- `-c` 指定的配置文件不存在时，报错中显示用户给出的路径，不再显示包目录下的路径。
+- 修复一个文件无法保存就中止整批下载的问题（#179）：目录无法创建、文件无法打开或改名、`desc.txt` 等文本文件写入失败时，只把这个文件记为下载失败并继续下载其它文件，结束时列出失败的文件并以退出码 `1` 结束；这类本地文件错误不再换链接重复请求。`Path.exists` 遇到文件名过长时抛出的异常也不会再中止下载。
+- 文件名连同后缀超过 `255` 字节时截断中间部分（#179）：`ext4` 与多数 `NAS` 按字节限制文件名长度，中文文件名此前容易超出而无法保存。默认命名模板的文件名不会触及上限，不受影响；拼接了昵称、多段文案等字段的自定义模板生成的超长文件名会被截断，在 `Windows`、`macOS` 上已按原名下载的这类文件会按新名称重新下载一次。新增 `f2.utils.file.name.fit_filename`。
+- `Windows` 下路径超过 `260` 个字符时自动改用扩展长度路径（`\\?\`），不需要开启系统的长路径支持（#179）；新增 `f2.utils.file.path.long_path`。
+- 微博主页模式支持 `--interval` 日期区间（#222）：微博主页接口不支持按日期查询，改为从最新的微博开始翻页，只下载区间内发布的微博（首尾两天都包含，按北京时间计算），翻到区间开始之前的微博时停止；置顶微博在区间内时同样下载，不影响翻页。日期格式错误或结束日期早于开始日期时直接报错退出，不会发起请求。`fetch_user_weibo` 新增 `interval` 参数；新增 `f2.utils.time.timestamp.parse_interval`。
+- 修复微博主页模式的 `--max-counts` 不生效：此前没有传给翻页函数，总是下载全部微博；接口每页固定返回约 20 条，超出上限的部分会被截掉。
+- 修复 `--no-log-file` 时出错会把完整堆栈打印到控制台的问题：没有日志文件时错误堆栈直接丢弃，控制台只输出一行错误原因。
+- 语言切换测试改为写入配置副本，运行测试不再改动包内的 `conf.yaml`。
+- 文件名规则变化，升级后会按新文件名重新下载一次（#248）：文案与昵称不再把标点、空格、日文假名、emoji 等字符替换为下划线，只把系统不允许的 `\ / : * ? " < > |` 换成外观相近的全角字符，换行等控制字符换成空格或去掉，并去掉首尾空格与结尾的点。多数作品的文件名和部分作者的文件夹名会因此变化：作者文件夹会在下次下载时自动改为新名称，同步主页时文件名变化的作品会按新名称重新下载，旧文件仍留在文件夹中，可按需清理。各应用的命名模板文档已同步说明。
+- TikTok 生成设备 ID 时同样逐个读取 `Set-Cookie` 头，`tt_chain_token` 等值里带逗号时不再被截断；新增 `f2.utils.http.cookie.join_set_cookie_headers`，微博游客 cookie 也改用它。
+- 微博生成游客 cookie 时逐个读取 `Set-Cookie` 头，不再把多个头拼成一行后按逗号切分，值里带逗号时不会被截断（移植自 #434）。
+- 支持用户级 `conf.yaml` 覆盖默认配置（#377）：按优先级从低到高读取 `~/.f2/conf.yaml`、当前目录的 `conf.yaml` 与环境变量 `F2_CONFIG` 指定的文件，叠加在 `site-packages` 中的 `conf.yaml` 之上，只需写出要修改的部分；用户配置不会写回默认配置文件，界面语言仍由 `-l` 设置。
+- `--init-config` 不再覆盖已有的配置文件：文件里没有该应用时追加默认配置，已有时只补充缺少的配置项，已有的值、其他应用的配置和注释都会保留，修改前把原文件备份为同名 `.bak` 文件；配置文件无法解析或顶层不是键值映射时报错且不做修改。同一个文件可以依次为多个应用初始化。
+- CLI 新增全局选项 `--no-log-file`（#293）：写在应用名之前时只在控制台输出日志，不创建 `logs` 目录，也不清理旧日志，适合没有写文件权限的环境；作为库使用时本来就不会写日志文件。
+- 修复抖音直播弹幕无法获取的问题（#412）：弹幕初始化接口新增了对 cookie 字段 `x-web-secsdk-uid` 的强校验，缺少时返回空内容。`fetch_live_im` 现在会在 cookie 缺少该字段时自动补上随机值；新增 `TokenManager.gen_secsdk_uid` 与 `TokenManager.ensure_secsdk_uid`，文档示例的 cookie 同步更新（`__live_version__` 更新为 `1.1.4.7838`）。
+- 修复 Twitter 单条推文下载失败（#436、#404）：接口在 `instructions` 前面插入了 `TimelineClearCache` 指令，推文详情改为按指令内容与 `entryId` 定位目标推文；评论或回复的链接不再下载到上层推文（#234）；受限推文（`TweetWithVisibilityResults`）也能读取。
+- 修复 Twitter 推文文案为空时报 `'NoneType' object has no attribute 'strip'` 的问题（#436、#404）。
+- Twitter 视频只取 MP4 并按码率选择最高清晰度，不再依赖接口返回的变体顺序（#436、#368）；新增 `sort_mp4_urls`、`best_mp4_url`。
+- Twitter 自动把 `cookie` 中的 `ct0` 作为 `X-Csrf-Token`，并优先于配置文件里的值，避免两者不一致导致 403（#426，移植自 #442）。
+- Twitter 主页、点赞、书签推文的命名模板支持 `{uid}`（移植自 #442）。
+- 修复抖音 `51`、`53`、`66` 等新作品类型不下载的问题（#402）：下载器不再使用写死的作品类型名单，图集作品或带有图片的作品下载图集，其他作品只要有视频链接就下载视频；新增 `DouyinDownloader.download_media`。
+- 抖音作品没有可下载的视频或图片、或可见状态不支持下载时输出警告并注明原因，此前会静默跳过。
+- 修复查询串不超过 32 个字符时生成 X-Bogus 抛出越界异常或得到错误签名的问题（#389）：原始字符串一律按原文计算 md5，只对 md5 摘要做十六进制解码；过短的自定义 `User-Agent` 同样受影响，已一并修复。正常长度查询串的签名不变。
+- 修复抖音合集下载失效（#423）：合集短链现在会跳转到短剧分享页 `share/playlet/detail/`，而 `MixIdFetcher` 只识别 `collection/`。现在支持合集页、合集分享页 `share/mix/detail/` 与短剧分享页，地址里已经带有合集 ID 时不再发起请求；短剧按合集下载。
+- 抖音合集模式不再吞掉解析错误：只有链接不是合集页时才改用作品链接解析，并在警告里给出原因；作品不属于任何合集或合集为空时以明确的错误结束（此前合集为空会报变量未绑定）。
+- 翻译源文件 `.po` 纳入版本控制：由现有 `.mo` 重建 `en_US.po` 与 `zh_CN.po`，放在各自 `.mo` 所在目录且不打包进 wheel；`make_pot` 脚本改为只用 `pybabel` 从 `f2` 与 `tests` 抽取文案、更新这两个 `.po` 并编译 `.mo`，位置引用只保留文件名；新增测试检查 `.mo` 与 `.po` 的译文一致。重建时移除了 74 条代码中已不存在的旧译文，现行文案的译文不变；`Babel` 开发依赖下限提高到 2.14.0。
+- 修复 GitHub 安全页的文档依赖告警：文档站 `vitepress` 升级到 1.6.4，并通过 `pnpm.overrides` 使用 `vite` 6.4.3，同时刷新锁文件中的 `esbuild`、`rollup`、`postcss`、`nanoid`、`preact` 与 `mdast-util-to-hast`；这些依赖只用于构建文档，不影响 PyPI 包。
+- 开发依赖升级：`black` 26.5.1（修复缓存文件任意写入漏洞，`pre-commit` 同步到同一版本，并按新版风格重新格式化）、`pytest` 9.1.1（修复临时目录处理漏洞）与 `pytest-asyncio` 1.4.0（旧版不支持 `pytest` 9）。
+- `bark` 推送加密使用 `ECB` 模式时输出安全警告；保留该模式只为兼容 Bark App 的同名选项，推荐使用 `CBC`。
+- `bark` 推送加密的随机 `iv` 改为由字母和数字组成，不再只用数字（此前 `GCM` 的 12 位 `iv` 只有约 40 比特随机性，同一密钥推送量大时可能重复）；新增 `generate_alphanumeric_bytes`。
+- Issue 模板改为表单：关键信息设为必填，新增「平台接口失效」与「文档问题」模板，关闭空白 issue，并把一般提问与功能想法引导到讨论区、安全问题引导到私密报告；新增按表单中所选平台自动添加标签的工作流。
+- 修复微博、TikTok、twitter 在第一页就结束或没有作品时报 `nickname_raw` 未绑定的问题（#401，此前只修复了抖音）。
+- 修复微博视频的类型为整数 `11` 时被判定为无法下载的问题（#249、#359）。
+- 修复 TikTok 主页作品翻页：接口返回字符串游标时第二页崩溃、最后一页之后从头重新抓取、空页面返回错误码时反复请求（#270）；点赞、收藏、合集每页作品数被重复计数，导致只下载到一半就结束。
+- 文档：快速上手与配置文件页中的 `f2 apps` 改为 `f2 dy` 等具体命令，列出各应用简称（#439）。
+- 贡献规范：`PR` 需提交到当前开发分支（目前为 `v0.0.1.8-pw3`），不要提交到 `main`；新增 `PR` 模板与目标分支检查工作流，`dependabot` 改为向开发分支提交更新，`README` 的开发分支徽章更新为 `v0.0.1.8-pw3`。
+- 异常在构造时不再输出日志：`CLI` 中止时只输出一行错误原因和 FAQ 链接，不再重复打印四五行错误；读取配置等准备阶段抛出的 `F2Error` 也按同样方式报告，不再打印完整堆栈。作为库使用时由调用方决定是否记录。
+- 修复 `FileError` 没有文件路径时异常信息为空的问题（移植自 #433）。
+- 修复出错时 `CLI` 退出码仍为 `0` 的问题：接口请求失败（HTTP 状态码错误、重试耗尽、网络错误、返回内容不是 JSON）不再被吞成空数据，而是抛出 `F2Error` 子类，`CLI` 以退出码 `1` 结束；有文件在所有链接都尝试后仍下载失败时，同样以退出码 `1` 结束并列出失败的文件。
+- 作为库使用时，`crawler` 与 `handler` 的方法在接口请求失败时抛出异常，不再返回空数据；接口异常的 `status_code` 为真实的 HTTP 状态码（此前为 `None`）。
+- 修复 `bark` 通知发送失败时仍提示发送成功的问题；`f2 bark` 发送失败时以退出码 `1` 结束，作为下载通知时失败仍只记录日志。
+- 修复抖音主页作品、单个作品、点赞、收藏等接口返回 `403`（`Blocked by ArgusSecurityPlugin`）的问题：请求自动附加网关要求的 `x-tt-argus` 请求头，并从 cookie 读取 `UIFID`/`UIFID_TEMP` 作为 `uifid` 请求头，游客 cookie 同样适用 #443（移植并扩展自 #446）。
+- `conf.yaml` 中 `douyin.headers` 的全部请求头都会生效，不再只取 `User-Agent` 与 `Referer`，便于手动覆盖网关请求头。
+- 新增 `f2.utils.http.cookie.parse_cookie_str`，把 Cookie 字符串解析为字典。
+- 测试配置支持通过环境变量 `F2_TEST_<APP>_<KEY>` 与 `conf/test.local.yaml` 覆盖，个人 cookie 无需写入仓库。
+- `wheel` 不再打包 `f2/apps/*/test` 测试目录与 `conf/test.yaml` 测试配置。
+- 新增 `security` 工作流：`gitleaks` 泄露扫描与 `wheel` 内容检查。
+- TLS 证书校验可配置：`conf.yaml` 新增 `verify`（默认开启），应用命令行新增 `--insecure`，作为库使用时可通过 `kwargs["verify"]` 传入。
+- 版本检查改用 `packaging` 比较版本号，并开启证书校验。
+- 修复分块下载重试时重复写入已下载字节的问题；服务器忽略 `Range` 返回整个文件时会重新下载而不是追加。
+- 修复 m3u8 分片下载修改共享客户端默认请求头，导致同一下载器上其它请求丢失 `Referer`/`Cookie` 的问题。
+- 导入 `f2` 模块不再产生副作用：请求模型的 `msToken` 改为首次实例化时获取并在进程内缓存（`TokenManager.cached_msToken`）；日志目录与日志文件仅在 CLI 启动或调用 `log_setup` 时创建；导入 `f2.utils.string.generator` 不再重置全局随机种子。
+- `log_setup` 新增 `log_path` 参数，可自定义日志目录或传 `None` 关闭文件日志。
+- 修复启动时清理旧日志会把当前进程刚创建的空日志文件一并删除、导致 macOS/Linux 下 CLI 日志文件丢失的问题。
+- 新增 `ci` 工作流：`ruff`/`black`/`isort`/`mypy` 检查、Python 3.10–3.13 测试矩阵（`pytest -m "not network"`）、构建与 `wheel` 冒烟测试，并接管 Codecov 上传。
+- 新增 `release` 工作流：发布 GitHub Release 后校验标签与版本号一致，并通过 PyPI Trusted Publishing 发布（草稿不触发，pre-release 只构建不发布）。
+- 删除 `pytest.ini`，pytest 配置统一到 `pyproject.toml`（此前 `pytest.ini` 优先生效，`testpaths` 与 `network` 标记的注册都未起作用）；`isort` 跳过被 git 忽略的目录。
+- 新增根异常 `f2.exceptions.F2Error`，接口/配置/数据库/文件四类异常都继承它；`CLI` 遇到 `F2Error` 时只输出一行错误并以退出码 `1` 结束（堆栈写入 `f2-trace` 日志），各应用 `handler.main` 对未知模式改为抛出异常。
+- 随包发布 `py.typed`，类型检查器可以使用 `f2` 的类型标注（分类器早已声明 `Typing :: Typed`）。
+- 富文本帮助（`-h`）补充 `--insecure` 选项，`-r` 显示为实际的 `--max_retries`；新增测试保证富文本帮助包含命令行定义的全部长选项。
+- 补充本分支新增文案的英文翻译（证书校验、断点续传重试、版本比较）。
+- 修复同一进程导入多个应用时模式表互相覆盖的问题：`mode_handler` 改为按应用注册，各应用 `handler.main` 通过 `get_mode_handlers(__name__)` 查找自己的模式；全局 `mode_function_map` 移除。
+- 运行时依赖改为版本范围（下限为已验证或已修复漏洞的版本，上限为已验证最新版的下一个大版本），`babel`、`mypy-protobuf` 移至开发依赖，移除 `importlib_resources`（改用标准库）；`click`、`protobuf`、`cryptography` 的下限提升到已修复已知漏洞的版本。
+- `security` 工作流新增 `pip-audit` 依赖漏洞扫描，并每周定时运行。
+- 日志脱敏：`f2` 记录器在输出与向上传播前自动打码 cookie、token、密钥、密码与代理地址中的凭据；各应用调试日志打印配置时经 `redact_config` 处理，`bark` 不再以明文记录 API 密钥与设备密钥，代理探测不再记录带密码的地址。
+- 修复全新安装后 `import f2` 报 `No module named 'sniffio'` 的问题：`httpx-socks` 升级到 0.11.0（0.10.x 使用 `sniffio` 但未声明依赖，新版 `anyio` 不再附带它）。
+- 平台接口用例统一标记为 `network`，`pytest` 默认收集 `tests` 与 `f2/apps`；新增 `ruff` 配置并修复未使用导入/变量与裸 `except`；`twitter` 的 `UniqueIdFetcher`/`TweetIdFetcher` 改为使用配置代理。
+- 更新文档：证书校验配置、`--insecure` 选项、测试凭据注入方式、直播分片请求头、msToken 获取方式、日志配置与 CI/发布流程说明。
+- 改进配置文件与快速上手文档的表述，提升可读性。
+- 新增文档，介绍如何扩展默认数据模型并在接口中使用自定义 `Filter`。
+- 将在 `0.0.1.8` 版本中添加 `BiliBili` & `NetEaseMusic` 支持。
+- 将在 `0.0.1.8` 版本中维护更多的 `API` 与 `CLI` 功能。
+- 添加 `Socket` 代理支持。
+- 添加 `Cookie` 池，`Proxy` 池，`User-Agent` 池等支持。
+
+## [0.0.1.7] - 2024-12-31
+
+### Added
+
+- 添加 `douyin` 动图作品接口维护输出 #218
+- 添加无法查看网页端 `weibo` 的异常处理 #223
+- 添加 `douyin` 批量采集直播的代码片段
+- 添加 `Babel` 依赖
+- 添加支援电子邮件地址 -> `support@f2.wiki`
+- 添加文档域名 -> `f2.wiki`
+- 添加所有应用 `Bark` 推送服务
+- 添加启用应用 `Bark` 加密推送配置
+- 添加生成 `pot` 文件批处理
+- 添加 `Bark` 加密推送模式
+- 添加生成随机字节数字方法
+- 添加 `bark` 通过设备 `token` 推送接口端点
+- 添加 `RSA` 加密工具类
+- 添加 `AES` 加密工具类
+- 添加使用 `bark` 端点文件生成接口
+- 添加替换配置文件中空值为空字符串
+- 添加 `douyin` 作品状态统计方法
+- 添加 `douyin` 作品状态统计接口
+- 添加 `cli_commands` 覆盖率测试
+- 添加 `x` 书签（收藏）推文模式
+- 添加 `x` 喜欢推文模式
+- 添加提取 `x` 标题方法
+- 添加 `weibo` 工具类测试用例
+- 为 `FAQ` 添加 `'NoneType' has no len()` 解决方案
+- 添加 `interval` 参数通用的方法处理
+- 统一使用 `Live` 管理进度条任务
+- 新增 `weibo` 文案提取方法
+- 添加通用过滤器转列表的方法
+- 允许中断来跳过版本检查
+- 添加 `tiktok proto` 元数据
+- 主配置添加 `Bark token` 配置
+- 添加 `Bark volume` 配置
+- 添加 `tiktok wss` 客户端配置管理方法
+- 添加 `tiktok` 作品区间 `interval` 参数支持
+- 添加 `Bark` 警告通知级别 https://github.com/Finb/Bark/issues/152
+- 添加 `tiktok` 直播间信息与弹幕信息回调方法
+- 添加 `tiktok` 直播弹幕接口模型
+- 添加 `tiktok` 直播间接口模型
+- 添加 `tiktok` 基础直播间接口模型
+- 为 `douyin` 弹幕爬虫添加代理参数
+- 添加弹幕输出开关
+- 添加了通知推送 `Bark` 应用
+- 添加了代理验证功能
+- 添加 `douyin` 直播间消息显示参数
+- 添加 `bark` 通知配置
+- 添加 `douyin`本地 `wss` 客户端配置
+- 添加 `tiktok` 弹幕接口
+- 添加 `douyin` 作品翻页时间码显示
+- 新增实况图集下载 #75
+- 新增 `douyin` 本地弹幕 `wss` 转发服务
+- 新增大量 `douyin` 直播间弹幕回调接口
+- 添加抖音 `live` 作品解析
+- 添加支持 `proxy` 的 `websockets` 依赖
+- 添加 `py` 版本检查
+- 添加筛选作品 `filter_by_date_interval` 方法
+- 添加 `interval_2_timestamp` 方法
+- 添加 `str_2_timestamp` 方法
+- 在异步线程池中检测 `F2` 版本
+
+### Changed
+
+- 优化 `tiktok` 播放列表相关方法
+- 优化 `douyin` 动态作品错误的处理
+- 优化注册信号类
+- 调整进度条的完成百分比为 `2` 位小数
+- 优化直播流 `504` 状态码的处理
+- 优化应用任务通知结构
+- 为 `weibo` 详情过滤器添加 `nickname_raw` 字段
+- 优化选择 `Bark` 加密通知判断逻辑
+- 分离 `douyin` 房间号提取方法
+- 改进 `x` 短链的解析与错误捕获
+- 改进错误捕获与代码规范
+- 增加 `tiktok SecUserIdFetcher` 类的稳定性
+- `tiktok` 提取 `secUid` 方法支持视频链接
+- 优化下载 `douyin` 直播流超时处理捕获层级
+- 更新 `bark` 模式列表与其他调整
+- 更新 `x` 工具类方法注释与方法名
+- 添加贡献者 #213
+- 更新 `x` 获取用户唯一 `ID` 类名
+- 修改 `x` 爬虫初始化可接受 `x_csrf_token` 参数
+- 将 `weibo` 用户 `id` 变量名改回 `uid`
+- 更新 `tiktok odin_tt` 生成方法
+- 改进直播流下载时受服务器返回的 `HTTP` 不规范的错误
+- 更新 `docs` 工作流为 `pnpm` 包管理器
+- 更新 `bark` 加密推送，改用随机 `iv`
+- 取消 `AES` 算法 `CBC` 模式一起返回 `Iv` 的情况
+- 为 `Bark` 接口爬虫 `GET` 方法添加 `URL` 转义
+- 为 `bark` 基础模型添加默认值
+- 修复 `bark token` 校验函数
+- 更新 `douyin` 好友作品接口模型缺失值
+- 调整 `douyin` 通过 `app` 分享的直播短链问题情况
+- 调整堆积的丢失信息影响下载任务显示
+- 调整 `douyin` 视频默认清晰度地址，最高可下 `4K` 作品  #209
+- 更新 `douyin` 代码片段 #197
+- 优化 `x` 一些边界情况处理
+- 分离获取 `weibo` 用户数据的 `2` 种方法
+- 计算 `x` 推文数量时过滤空值
+- 调整 `x` 应用细节
+- 更新 `x` 喜欢模式
+- 更新爬取 `x` 主页推文方法
+- 更新 `x` 用户推文数据过滤器
+- 优化 `x` 下载器
+- 更新 `x` 接口模型
+- 手动刷新 `live` 管理器防止闪屏
+- 完善 `douyin` 测试用例
+- 调整 `base_crawler` 异常捕获
+- 改进 `weibo` 方法为异步生成器并添加翻页
+- 调整 `weibo` 提取文案的方法
+- 更改默认异步事件循环作用域，确保兼容性
+- 更新 `x` 发布时间字段
+- 更新项目 `python` 最低要求版本 >= `3.10.0`
+- 优化了过滤器性能并提取为通用方法
+- 更新 `weibo` 下载器
+- 更新 `timestamp_2_str` 方法，新增列表转换与递归
+- 更新关闭信号注册入口
+- 更新 `ua` 版本 `126` -> `130`
+- 支持自定义 `ua` 生成 `abogus`
+- 更新代码片段
+- 使用异步任务处理 `douyin` 直播弹幕信息
+- 更新 `douyin proto` 元数据
+- 优化 `base_crawler`，添加更多边界处理
+- 为文本正则解析方法添加空值处理
+- 极大提升 `jsonpath` 解析性能
+- 捕获 `yaml` 格式错误导致无法解析
+- 修改终端输出格式
+- 捕获 `tk设备id` 注册时因网络问题导致的出错
+- 更新 `douyin` 直播消息 `callback` 方法
+- 优化 `douyin` 本地 `WebSocket` 服务性能
+- 更新 `douyin` 直播 `BattleTeamTaskMessage` 消息 `proto` 结构体
+- 调整 `douyin` 图集文件回 `webp` 格式
+- 添加毫秒级时间戳字符串转换
+- 优化时间戳转字符串函数
+- 重写 `json_filter` 逻辑
+- 完善 `douyin` 直播 `protobuf`
+- 优化抖音 `interval` 参数的作品解析
+- 完善静态类型检查
+- 调整进度条显示 #105
+- 更新 `douyin` 处理下载任务
+- 更新 `douyin` 筛选日期区间作品方法
+- 更新日志文件名
+- 调整 `i18n` 方法防止重复导入错误
+- 更新 `douyin` `abogus` 代码片段
+- 更新 `vitepress` 工作流
+- 更新 `tiktok` 的 `webmssdk` 版本号
+- 更新 `douyin` 直播 `signature` 参数
+- 更新 `douyin` 弹幕 `sdk` 版本 `1.0.12` -> `1.0.14-beta.0`
+
+### Deprecated
+
+- 弃用 `douyin` 扫码登录方法警告
+- 弃用 `WebcastSignatureManager.model_2_endpoint` 方法
+- 弃用 `_get_first_item_from_list` 方法
+- 弃用 `num_to_base36` 方法
+
+### Removed
+
+- 删除 `bark` 无用的代码
+- 删除 `x` 重复 `utils` 方法
+- 删除 `weibo` 工具类重复代码
+- 删除 `npm` 锁定文件
+- 删除 `douyin wss` 重复回调方法
+- 删除 `tiktok` 基础接口模型默认 `设备id`
+- 删除 `x` 错误的接口
+- 删除 `x` 转推模式
+- 删除测试无效的 `JSONPath` 测试
+
+### Fixed
+
+- 修复 `x` 无法下载图文的错误
+- 修复 `tiktok` 作品没有视频链接的错误
+- 修复 `douyin` 收藏夹类型错误
+- 修复 `Bark` 没有设置密钥时加密推送失败的情况
+- 修复 `vitepress sidebar` 配置
+- 修复下载器并发限制不起作用的问题
+- 修复 `weibo` 遗漏 `uid` 变量名修改
+- 修复 `douyin` 封面下载错误 #213
+- 修复 `douyin` 关注用户排序类型翻页的问题 #210
+- 修复防止变量未完成初始化
+- 修复 `weibo` 过滤器字段 #149
+- 修复文档线上不显示 `icon` 的问题
+- 修复 `douyin` 错误的弹幕消息类型日志
+- 修复 `tiktok` 错误的本地化代码
+- 修复事件循环风险 #159
+- 修复 `tiktok` 接口过滤器处理空值的错误
+- 修复 `tiktok` 直播流文件名解析错误
+- 修复 `x` 默认配置名 #145
+- 修复 Incomplete URL substring sanitization #139
+- 修复 `douyin` 的 `webmssdk` 库创建缓冲区的安全性问题
+- 修复 `tiktok` 读取 `BaseRequestModel` 配置的错误 #79
+- 修复 `F2` 版本检测逻辑
+- 修复文档编译 `dead link` 的情况
+
+### Security
+
+- 更新 `pytest-asyncio` 版本到 `0.25.0`
+- 更新 `browser_cookie3` 版本到 `0.20.1`
+- 更新 `vitepress` 版本到 `1.5.0`
+- 更新 `pydantic` 的新方法 `ConfigDict` 代替 `Config` 类
+- 更新 `protobuf` 版本到 `5.28.3`
+- 更新 `aiofiles` 版本到 `24.1.0`
+- 更新 `importlib-resources` 版本到 `6.4.5`
+- 更新 `pytest` 版本到 `8.3.4`
+- 更新 `jsonpath-ng` 版本到 `1.6.1`
+
+## [0.0.1.6] - 2024-05-04
+
+### Added
+
+- 添加`weibo`应用
+- 添加`abogus(limit ua)`加密
+- 添加`douyin`加密算法切换配置
+- 添加基础接口模型转url类
+- 添加`WebSocket`爬虫客户端
+- 添加`douyin`直播wss签名管理器
+- 添加`douyin`直播wss签名生成类
+- 添加`douyin`工具JS库`webmssdk.es5-1.0.0.53`
+- 添加`douyin`直播间弹幕wss接口
+- 添加`F2`版本检测
+- 添加`tiktok`直播间开播状态
+- 添加`PyExecJS==1.5.1`依赖
+- 添加`protobuf==4.23.0`依赖
+- 添加`websockets>=11.0`依赖
+- 添加`tiktok`的`device_id注册`与`cookie`管理类
+- 添加`douyin`生成`webid`配置
+- 添加`douyin`关注用户直播
+- 添加`douyin`，`tiktok`模型配置
+- 添加`conf.yaml`配置版本号
+- 添加`tiktok`集成测试
+- 添加`traceback`输出
+- 添加`douyin`短剧作品
+- 添加同步客户端的同步`transport`
+- 添加同步客户端
+- 添加`douyin`直播弹幕初始化
+- 添加`douyin`合集`mix_id`获取方法
+- 添加`douyin`查询用户
+- 添加时间戳转换的默认时区设置（`UTC/GMT+08:00`）
+- 添加`ClientConfManager`为每个应用提供方便的配置读取
+- 添加`uniqueId`查询`tiktok`的`user_db`
+- 添加获取`segments`的`duration`列表方法
+- 添加应用运行模式的输出
+- 新增`tiktok`作品搜索
+- 新增`tiktok`用户直播
+- 添加反转义`JSON`方法
+- 新增`douyin`相关推荐
+- 新增`douyin`好友作品
+
+### Changed
+
+- 更新`__aexit__`方法
+- 更新`douyin`加密算法代码片段
+- 更新`weibo`测试用例
+- 优化命令不存在的输出
+- 取消接口数据过滤器对`bool`的预处理
+- 调整停止异步任务信号
+- 更新`douyin`的`xbogus`调用
+- 为装饰器文件重命名
+- 更新获取`Content-Length`的方法
+- 防止`douyin`直播结束时下载崩溃
+- 更新`BaseCrawler`类处理`httpx`即将弃用`proxies`参数
+- 更新`tiktok`的`msToken`配置
+- 修复`ClientConfManager`参数
+- 更新了所有应用配置
+- 重构了所有工具类方法
+- 更新`base_downloader`的区块下载参数
+- 修改`douyin`生成的`ttwid`将绑定`ua`
+- 修改`tiktok`用户直播下载流地址
+- 修改`douyin`，`tiktok`获取用户信息方法名
+- 完善时间戳转换类型，支持30位
+- 修改应用的代理配置名（`http: https: -> http://: https://:`）
+- 更新`xb`算法示例部分
+- 更新`base_crawler`异常捕获与输出
+- 更新应用初始化配置文件后退出 (#70)
+- 更新应用使用`--auto-cookie`命令后退出
+- 更新`douyin`过滤器，将`video_play_addr`返回完整视频列表便于下载失败轮替
+- 更改`douyin`图集文件名（`jpg -> webp`）
+- 更改应用直播下载文件名（`mp4 -> flv`）
+- 更新应用工具类网络错误捕获
+
+### Deprecated
+
+- 弃用`douyin`SSO扫码登录
+- 类`BaseModel`中的`dict`方法已弃用(`pydantic>=2.6.4`)
+- 类`datetime`中的`utcnow`方法已弃用
+- 弃用`douyin`，`tiktok`获取用户名方法
+
+### Removed
+
+- 删除`tiktok`基础请求模型的无用参数
+- 删除`f2\utils\utils.py`无效导入
+
+### Fixed
+
+- 修复`douyin`接口更新导致的错误 #104
+- 修复`_dl`日志输出
+- 修复`douyin`下载合集时合集链接无法识别的情况
+- 修复`tiktok`下载播放列表（合集）的错误
+- 修复`m3u8`流下载时会重复下载`ts`片段的问题
+- 修复`m3u8`流获取`content_length`时没有提供代理参数造成的访问失败
+- 修复`douyin`，`tiktok`因提前引发异常导致无法生成虚假的msToken
+
+### Security
+
+- 更新`pytest`版本到`8.2.1`
+- 更新`pydantic`版本到`2.6.4`
+- 更新`httpx`版本到`0.27.0`
+- 更新`aiosqlite`版本到`0.20.0`
+
+
+## [0.0.1.5] - 2024-04-04
+
+### Added
+
+- 添加安全政策汇报
+- 添加`run_app`时输出版本号
+- 添加`douyin`用户收藏夹下载
+- 添加`douyin`的`filter`对非法收藏夹名字符的处理
+- 添加`douyin`用户音乐收藏下载
+- 添加`douyin`音乐歌词json转lrc方法
+- 添加`douyin`用户收藏音乐下载任务
+- 添加`douyin`配置`--lyric`
+- 添加`f2 utils`的`get_cookie_from_browser`方法
+- 添加`f2 utils`的`check_invalid_naming`方法
+- 添加`f2 utils`的`merge_config`方法
+- 添加`douyin`粉丝用户接口方法
+- 添加`douyin`关注用户接口方法
+- 添加`douyin`，`tiktok`数据过滤器的原始字段
+- 添加对30位时间戳进行格式化
+- 添加测试抖音原声歌词转换
+- 添加获取抖音用户粉丝代码片段
+- 添加获取抖音用户关注代码片段
+- 添加`fetch`方法的`timeout`参数，避免请求过于频繁
+- 添加`douyin`用户收藏夹代码片段
+- 添加对丢失链接的重试逻辑
+- 添加`自定义UA`生成`XBogus`参数
+- 添加`douyin`，`tiktok`对`UserProfile`请求内容为空的报错
+
+### Changed
+
+- 修改`douyin`主页收藏模式为`collection`
+- 更正`douyin`文档`user-mix`方法
+- 修改`F2`版本号输出
+- 修改`douyin`，`tiktok`帮助信息
+- 优化`douyin`，`tiktok`的`utils`中`msToken`，`ttwid`，`sec_user_id`，`aweme_id`，`webcast_id`，具体请求错误的输出
+- 明确`douyin`，`tiktok`所有`fetch`函数返回为过滤器类型
+- 更新了F2版本号的导入
+- 优化`tiktok`的`handler`处理播放列表的逻辑
+- 优化`douyin`，`tiktok`中对具体请求错误的输出
+- 更正`douyin`，`tiktok`受`collects_id`类型导致的多次转换
+- 更正`tiktok`的`handler`多种获取用户信息方法的参数
+- 添加`base_downloader`对重命名文件时的异常处理
+- 更新`_dl`的`head`请求`Content-Length`失效时调用`get`方法
+- 更新`douyin`，`tiktok`接口文档代码片段
+- 更新`douyin`，`tiktok`在`cli`中的`handler_auto_cookie`方法
+- 更新`douyin`，`tiktok`在`cli`中的`handler_naming`方法
+- 更新`douyin`，`tiktok`的`--mode`统一`choice`管理
+- 更新`F2`帮助说明格式
+- 统一了`douyin`关注粉丝用户的`total`字段
+- 修改下载逻辑以提高性能
+- 更新`douyin`，`tiktok`数据库字段(需要删除旧数据库或迁移)
+- 优化`douyin`，`tiktok`的`handler`模块注释表达与方法参数格式
+- 重构了所有`handle`方法的调用
+- 重构了所有`fetch`方法的返回类型
+- 调整`douyin` `mix`作品在没有更多数据时提前`break`
+- 调整`tiktok`获取用户数据去除地区参数
+- 优化在适当的位置`yield`作品数据
+- 修改日志输出级别
+- 重构数据库异常类
+- 重构文件异常类
+- 重构接口异常类
+- 完善`i18n`消息
+
+### Deprecated
+
+- 弃用`douyin` `UserLiveFilter`的无用方法
+- 弃用`douyin` `PostDetailFilter`的无用方法
+
+### Removed
+
+- 删除文档旧版本`-d`指令
+- 移除`tiktok`的`post\detail`接口示例
+- 删除无用的`__init__.py`文件
+- 删除`douyin`，`tiktok`：`cli`下的`get_cookie_from_browser`方法
+- 删除`example`示例
+- 删除无用导入
+- 删除`apps`中db模块的`aiosqlite`导入与错误处理
+
+### Fixed
+
+- 修复本地化服务
+- 修复`douyin`关注用户数据过滤器`_to_list`方法的排除字段
+- 修复`douyin`数据过滤器时间戳类型
+
+### Security
+
+- 更新`rich`版本到`13.7.1`
+- 更新`douyin`接口版本到`19.5.0`
+
+
+## [0.0.1.4] - 2024-02-16
+
+### Added
+
+- 添加`black`格式化白名单
+- 添加`douyin`，`tiktok`命令行对`--proxies`命令的支持
+- 添加`tiktok`数据库忽略字段
+- 添加文档QA页面
+- 添加`douyin`对`msToken`值验证
+- 添加写入配置文件时处理文件权限问题
+- 添加提取有效URL的错误类型
+- 添加`split_filename`方法处理不同系统下文件名长度
+- 添加`douyin`，`tiktok`：`cli`模块的`merge_config`方法
+- 添加了低频配置文件默认路径
+- 添加`split_filename`函数单元测试
+- 添加`base_downloader`模块日志堆栈错误输出
+- 添加`tiktok`的`get_secuid`方法对不支持地区的错误消息
+- 添加`douyin`，`tiktok`：`utils`模块对空urls列表的错误处理
+- 添加`douyin`，`tiktok`：`utils`模块对AwemeIdFetcher的连接失败处理
+- 添加`douyin`图集`aweme_id`测试链接
+- 添加文档`algolia`配置参数
+- 添加`douyin`，`tiktok`：`{aweme_id}`与`{uid}`的文件名模板
+
+### Changed
+
+- 重写`douyin`，`tiktok` handler对`crawler`与`dl`的配置，提升性能
+- 将`dict`类型的`--proxies`添加默认值`None`
+- 将配置文件中`url`设置为空，防止因为缺省出错
+- 对高低频配置合并时只合并非空值
+- 更新翻译模板
+- 调整`timestamp_2_str`方法的默认时间字符串格式
+- 将低频参数配置移入`F2`的`conf.yaml`
+- 修改`tiktok`对`msToken`值验证
+- 修改`douyin`，`tiktok`的`TokenManager`里固定配置的读取方式
+- 改进 `douyin`，`tiktok` handler类的结构和清晰度
+- 更新方法签名，使用 `self` 替代 `cls`
+- 在适当的情况下，用异步实例方法替代类方法
+- 更新`douyin`，`tiktok` `handler`类下的`fetch`用法
+- 修改`main`入口函数，实例化每个app的`handler`并传递给相应的方法
+- 更新`douyin`，`tiktok`的`get_or_add_user_data`方法，以处理`Filter`类型的数据
+- 更新`F2 -d`参数，现在需要指定`debug`模式
+- 更新`conf_manager`模块，添加了日志输出
+- 更新`douyin`接口文档`format-file-name`代码片段
+- 更新`douyin`，`tiktok`的`crawler`模块重新添加异步上下文管理器
+- 更新`douyin`，`tiktok`的`utils`模块捕获错误时显示具体类名
+- 更新了配置文件加载逻辑
+- 更新了日志输出
+- 更新`split_filename`方法适配双语种环境
+- 更新`douyin`，`tiktok`的`crawler`模块获取`response`的多种http请求方法
+- 修改`file_exceptions`模块，使输出更简洁
+- 修改`db_exceptions`模块，使输出更简洁
+- 修改`api_exceptions`模块，使输出更简洁
+- 更改`base_crawler`模块里的方法名称
+- 完善所有`APIConnectionError`的错误处理
+- 更新在无代理时配置默认值
+- 改进`douyin`的cli模块的`handler_sso_login`方法
+- 更新`douyin`，`tiktok`单元测试用例
+- 更新接口文档开发者代码片段
+- 修改`cli_console`进度条默认宽度
+
+### Deprecated
+
+- 弃用`douyin`：`extract_desc_from_share_desc`方法
+- 弃用`douyin`：`get_request_sizes`方法
+
+### Removed
+
+- 移除文档`reference`页面
+- 删除`douyin`：`VerifyFpManager`注释代码
+- 删除`douyin`： `cli`模块的英文注释
+- 移除`split_filename`方法的`desc_length_limit`参数
+- 删除`conf.yaml`中的代理值
+- 删除`base_crawler`模块选择随机代理的注释代码
+- 删除`base_downloader`模块中`_download_chunks`方法的`finally`
+- 删除`F2 conf.yaml`中的代理值与无效值
+- 删除弃用接口测试
+
+### Fixed
+
+- 修复部分自定义配置失效的问题
+- 修复接口缺失时间戳值导致的问题
+- 修复`get_or_add_user_data`中的`AttributeError`问题
+- 修复了非windows系统下创建长中文名文件出错的问题
+- 修复了`tiktok`文件名出错的问题
+- 修复了在更新配置时缺少自定义配置文件路径的问题
+- 修复`douyin`直播嵌套ts文件无法获取字节大小的问题
+- 修复`base_downloader`下载文件区块时未能正确捕获超时错误
+- 修复`cli`退出时`base_downloader`出现`UnboundLocalError`错误的问题
+- 修复`douyin`收藏作品下载错误的问题
+- 修复`douyin`，`tiktok`：`cli`的默认参数影响kwargs合并
+- 修正`douyin`的`utils`模块对`aweme_id`的处理
+
+### Security
+
+- 依赖更新`pyyaml6.0 -> pyyaml6.0.1`
+
+
+## [0.0.1.3] - 2024-01-07
+
+### Added
+
+- 添加`douyin`，`tiktok`对`--interval`命令的支持
+
+### Changed
+
+- 取消`bool`参数的默认值，防止配置文件与`cli`命令冲突
+- 调整日志控制台输出与级别
+- 修改默认与自定义配置读取与合并
+- 恢复`tiktok`接口模型的`msToken`值
+- 修改自定义文件名模板中作品创建时间的键名
+- 更新主配置文件格式
+
+
+## [0.0.1.2] - 2024-01-05
+
+### Added
+
+- 添加依赖缺失时输出错误到日志
+- 使用`black`统一代码风格
+- 添加`douyin`单个作品(one)与`--sso-login`命令帮助
+
+### Changed
+
+- `--auto-cookie`命令去掉`none`参数
+- 所有app的`--interval`命令参数改为`all`
+- 完善`douyin`的`cli`帮助说明
+- 更新`F2`帮助说明
+- 完善`tiktok`的`cli`帮助说明
+- 修改代码片段高亮
+- 更新项目文档
+- 更新翻译文件
+
+### Fixed
+
+- 修复`--init-config`命令初始化的问题
+- 修复`douyin`文档`user-live`代码片段错误方法名
+- 修复`douyin`文档`user-mix`代码片段`aweme_id`不明的问题
+- 修复`douyin`，`tiktok`未提供参数也自动获取ck
+- 修复显示语言中`en_US`缺失
+- 修复接口文档的代码片段格式与错误
+- 使用缺省`none`来避免触发`callback`干预程序运行
+
+
+## [0.0.1.1] - 2024-01-01
+
+### Added
+
+- 添加依赖缺失时输出错误到日志
+
+### Fixed
+
+- 修复pyproject.toml依赖部分遗漏造成的`Error: No such command`
+
+
+## [0.0.1-pw.1] - 2024-01-01
+
+### Added
+
+- 创建文档
+- 添加`douyin`，`tiktok`应用
+- 添加`douyin`，`tiktok`测试
+- 添加代码示例
+- 添加`i18n`翻译模板文件
+- 添加`show_qrcode`方法，用于显示二维码
+- 添加`s_v_web_id`方法
+- `douyin`：添加`room_id`查询直播间信息接口
+- `douyin`：添加`--sso-login`命令，使用扫码获取cookie
+- `douyin`：添加`sso登录`测试
+- 添加`douyin`，`tiktok`开发接口文档
+- 添加`douyin`，`tiktok`接口地址生成XB的方法
+- 添加`douyin`，`tiktok`接口文档代码片段
+- 创建目录时支持绝对与相对路径
+- 添加`douyin`，`tiktok`获取列表`secuid`，`unique_id`，`aweme_id`的方法
+
+### Changed
+
+- 细化`Basecrwaler`的`response`处理方法
+- 自定义将日志输出到控制台
+- 将guide文档调整为统一文件夹下
+- 修改文档代码片段高亮行号
+- 重命名接口模型生成XB的方法
+- 修改`douyin`提取列表用户id返回值变量名
+- 修改`douyin`提取列表用户直播rid返回值变量名
+- 完善配置文件site-config部分
+- 修改默认配置参数置空
+
+### Fixed
+
+- 修复`douyin`用户数据库名称
+- 修复`douyin`直播结束后无法下载
+- 修复`douyin`在`handler_user_mix`方法中`AsyncUserDB`只初始化一次
+- 修复`user-nickname`代码片段导入
+- 修复`douyin`文档`user-get-add`代码片段导入
+- 修复`tiktok`文档`user-mix`代码导入与缩进
+- 修复`tiktok`文档`one-video`代码缩进
