@@ -91,11 +91,19 @@ export async function bootstrap() {
   csrf = data.csrf_token;
   return data;
 }
+// crypto.randomUUID 只在安全上下文(HTTPS/localhost)可用;
+// http 访问时降级为随机串,保证提交不报错。
+const uuid = () =>
+  globalThis.crypto?.randomUUID?.() ??
+  "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => {
+    const r = (Math.random() * 16) | 0;
+    return (c === "x" ? r : (r & 0x3) | 0x8).toString(16);
+  });
 export const post = <T>(path: string, body: unknown = {}) =>
   api<T>(path, {
     method: "POST",
     body: JSON.stringify(body),
-    headers: { "Idempotency-Key": crypto.randomUUID() },
+    headers: { "Idempotency-Key": uuid() },
   });
 export const terminal = (job?: Job | null) =>
   !!job && ["ready", "failed", "cancelled"].includes(job.status);

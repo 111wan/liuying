@@ -10,7 +10,7 @@ from .errors import AppError
 PLATFORMS = {
     "douyin": ("抖音", ("douyin.com", "iesdouyin.com")),
     "kuaishou": ("快手", ("kuaishou.com", "kuaishou.cn", "gifshow.com", "chenzhongtech.com")),
-    "xiaohongshu": ("小红书", ("xiaohongshu.com", "xhslink.com")),
+    "xiaohongshu": ("小红书", ("xiaohongshu.com", "rednote.com", "xhslink.com", "xhslink.cn")),
     "bilibili": ("哔哩哔哩", ("bilibili.com", "b23.tv")),
     "youtube": ("YouTube", ("youtube.com", "youtu.be")),
     "tiktok": ("TikTok", ("tiktok.com",)),

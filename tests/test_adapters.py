@@ -1,4 +1,5 @@
 import json
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -89,6 +90,48 @@ def test_redirect_removes_credentials(monkeypatch):
         )
         assert result.status_code == 200
         result.close()
+
+
+def test_http_client_loads_session_cookies_and_ignores_expired_entries(monkeypatch, tmp_path):
+    cookiefile = tmp_path / "cookies.txt"
+    cookiefile.write_text(
+        "# Netscape HTTP Cookie File\n"
+        ".rednote.com\tTRUE\t/\tTRUE\t0\tsession\tcurrent\n"
+        ".rednote.com\tTRUE\t/\tTRUE\t1\texpired\tstale\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(engine, "settings", lambda: SimpleNamespace(cookie_file=str(cookiefile)))
+    with engine.client() as client:
+        assert client.build_request("GET", "https://www.rednote.com/").headers["cookie"] == "session=current"
+        assert "cookie" not in client.build_request("GET", "https://www.xiaohongshu.com/").headers
+
+
+def test_tiktok_cover_and_media_follow_platform_proxy(monkeypatch, tmp_path):
+    proxy = "http://proxy.example:7890"
+    monkeypatch.setattr(engine, "settings", lambda: SimpleNamespace(proxy=proxy))
+    requests = []
+
+    def make_client(proxy=None):
+        def respond(request):
+            requests.append((proxy, request.url.host))
+            if request.url.path == "/cover.jpg":
+                return httpx.Response(200, headers={"Content-Type": "image/jpeg"}, content=b"cover")
+            return httpx.Response(403)
+
+        return httpx.Client(transport=httpx.MockTransport(respond))
+
+    monkeypatch.setattr(engine, "client", make_client)
+    data = engine.descriptor(
+        "https://www.tiktok.com/@sample/video/123", "tiktok", "样本",
+        thumbnail="https://images.example/cover.jpg",
+    )
+    engine.add_format(data, "test", [{"url": "https://new-cdn.example/video.mp4"}])
+    engine.cover(data, tmp_path)
+    assert data["public"]["cover"] is True
+    with pytest.raises(AppError) as error:
+        engine.download(data, data["public"]["formats"][0]["id"], tmp_path)
+    assert error.value.code == "SOURCE_EXPIRED"
+    assert requests == [(proxy, "images.example"), (proxy, "new-cdn.example")]
 
 
 def test_direct_head_fallback(monkeypatch):

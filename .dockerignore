@@ -1,5 +1,6 @@
 .git
 .venv
+.uv-cache
 .data
 .env
 .env.*
@@ -9,6 +10,7 @@ web/dist
 .pytest_cache
 .ruff_cache
 test-results
+.research
 research
 design
 *.md

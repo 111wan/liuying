@@ -19,6 +19,7 @@ class Settings(BaseSettings):
     max_bytes: int = 8 * 1024 * 1024 * 1024
     max_duration: int = 4 * 3600
     artifact_ttl: int = 3600
+    douyin_proxy: str = ""
     parse_timeout: int = 90
     download_timeout: int = 4 * 3600
     max_workers: int = 2

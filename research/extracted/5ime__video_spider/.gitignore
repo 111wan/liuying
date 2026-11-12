@@ -1,5 +1,0 @@
-/vendor/
-.env
-*.log
-/storage/rate_limit/*.json
-**/.php

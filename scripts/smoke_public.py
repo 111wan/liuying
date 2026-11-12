@@ -93,8 +93,9 @@ def download_sample(client, info, password):
     partial = request(client, "GET", ticket, 206, "byte range", headers={"Range": "bytes=0-31"})
     check(partial.content == response.content[:32], "byte range content mismatch")
     with httpx.Client(base_url=str(client.base_url), timeout=30, trust_env=False) as other:
-        request(other, "GET", ticket, 401, "anonymous file protection")
-        login(other, password)
+        if password:
+            request(other, "GET", ticket, 401, "anonymous file protection")
+            login(other, password)
         request(other, "GET", "/api/v1/session", 200, "second session")
         request(other, "GET", media_path, 404, "cross-session metadata protection")
         request(other, "GET", ticket, 404, "cross-session file protection")
@@ -116,22 +117,27 @@ def verify(args):
         "base URL must be an HTTPS origin without credentials, path, query, or fragment",
     )
     check(target.hostname in cfg.allowed_hosts, "target hostname is not explicitly in LIUYING_ALLOWED_HOSTS")
-    check(bool(cfg.access_password), "LIUYING_ACCESS_PASSWORD is empty")
+    password = None if args.anonymous else cfg.access_password
+    check(args.anonymous or bool(password), "LIUYING_ACCESS_PASSWORD is empty. Use --anonymous for a public instance.")
     origin = args.base_url.rstrip("/")
     # TLS verification stays enabled; redirects cannot forward credentials to another origin.
     with httpx.Client(base_url=origin, timeout=30, trust_env=False, follow_redirects=False) as client:
         page = request(client, "GET", "/", 200, "anonymous home")
-        check('name="password"' in page.text and '/api/v1/login' in page.text, "login form is missing")
-        request(client, "GET", "/api/v1/session", 401, "anonymous session protection")
-        request(client, "GET", "/api/v1/platforms", 401, "anonymous platform protection")
+        if password:
+            check('name="password"' in page.text and '/api/v1/login' in page.text, "login form is missing")
+            request(client, "GET", "/api/v1/session", 401, "anonymous session protection")
+            request(client, "GET", "/api/v1/platforms", 401, "anonymous platform protection")
+            login(client, password)
+            page = request(client, "GET", "/", 200, "authenticated home")
+        check('name="password"' not in page.text, "frontend still displays login form")
         health = request(client, "GET", "/api/v1/health", 200, "health").json()
         check(health.get("status") == "ok", "health status is not ok")
-        login(client, cfg.access_password)
-        page = request(client, "GET", "/", 200, "authenticated home")
-        check('name="password"' not in page.text, "authenticated home still displays login form")
-        info = request(client, "GET", "/api/v1/session", 200, "authenticated session").json()
-        check(bool(info.get("csrf_token")), "authenticated session has no CSRF token")
-        request(client, "GET", "/api/v1/platforms", 200, "authenticated platforms")
+        info = request(client, "GET", "/api/v1/session", 200, "session").json()
+        check(bool(info.get("csrf_token")), "session has no CSRF token")
+        session_cookie = next((cookie for cookie in client.cookies.jar if cookie.name == "liuying_session"), None)
+        check(session_cookie is not None, "site did not set the session cookie")
+        check(session_cookie.has_nonstandard_attr("HttpOnly"), "session cookie lacks HttpOnly")
+        request(client, "GET", "/api/v1/platforms", 200, "platforms")
         assets = Assets()
         assets.feed(page.text)
         asset_urls = [urljoin(origin + "/", url) for url in assets.urls]
@@ -151,15 +157,21 @@ def verify(args):
             and any(kind in response.headers.get("content-type", "") for kind in ("javascript", "text/css")),
             "frontend asset is empty or has the wrong content type",
         )
-        result = {"https": "passed", "access_gate": "passed", "secure_cookie": "passed", "frontend": "passed"}
+        result = {
+            "https": "passed",
+            "access_gate": "anonymous" if args.anonymous else "passed",
+            "session_cookie_secure": session_cookie.secure,
+            "frontend": "passed",
+        }
         if args.download:
-            result.update(download_sample(client, info, cfg.access_password))
+            result.update(download_sample(client, info, password))
         print("PASS", json.dumps(result), flush=True)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-url", default="https://wanxingchen666.xyz", help="HTTPS origin in allowed_hosts")
+    parser.add_argument("--anonymous", action="store_true", help="verify an instance without a site password")
     parser.add_argument("--download", action="store_true", help="also create sample jobs and verify file download")
     args = parser.parse_args()
     try:

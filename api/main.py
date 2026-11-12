@@ -143,7 +143,7 @@ async def handle_login(request: Request):
         AUTH_COOKIE,
         signer.dumps(hashlib.sha256(cfg.access_password.encode()).hexdigest(), salt=AUTH_SALT),
         httponly=True,
-        secure=cfg.secure_cookie,
+        secure=cfg.secure_cookie and request.url.scheme == "https",
         samesite="strict",
         max_age=30 * 86400,
     )
@@ -204,7 +204,7 @@ async def session_middleware(request: Request, call_next):
             "liuying_session",
             signer.dumps(owner, salt="session"),
             httponly=True,
-            secure=cfg.secure_cookie,
+            secure=cfg.secure_cookie and request.url.scheme == "https",
             samesite="strict",
             max_age=30 * 86400,
         )

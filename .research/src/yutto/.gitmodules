@@ -1,3 +1,0 @@
-[submodule "tests/test_biliass/test_corpus"]
-	path = tests/test_biliass/test_corpus
-	url = https://github.com/yutto-dev/biliass-corpus.git

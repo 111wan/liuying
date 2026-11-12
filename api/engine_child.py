@@ -6,6 +6,7 @@ Media URLs stay here/on the server; FFmpeg receives local files only.
 
 import hashlib
 import http.cookiejar
+import io
 import json
 import os
 import random
@@ -15,6 +16,7 @@ import string
 import subprocess
 import sys
 import time
+from copy import copy
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urljoin, urlsplit
 
@@ -22,6 +24,7 @@ import httpx
 import json5
 from imageio_ffmpeg import get_ffmpeg_exe
 from yt_dlp import YoutubeDL
+from yt_dlp.utils import DownloadError
 from yt_dlp.version import __version__ as YTDLP_VERSION
 
 from .bilibili import BiliBiliCDNIE
@@ -29,35 +32,12 @@ from .config import settings
 from .douyin_mint import MintError, mint_identity
 from .douyin_sign import VERIFY_FP_PARAMS, ABogus, encode_pairs, websign_sign
 from .errors import AppError, upstream_error
-from .security import install_network_guard, safe_url
+from .security import PLATFORMS, install_network_guard, safe_url
 
 UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 
 # 海外平台:从国内网络直连通常不可达,需要出口代理。
 FOREIGN_PLATFORMS = ("youtube", "tiktok", "instagram", "twitter")
-FOREIGN_HOSTS = (
-    "youtube.com",
-    "youtu.be",
-    ".googlevideo.com",
-    ".ytimg.com",
-    ".ggpht.com",
-    ".googleusercontent.com",
-    "tiktok.com",
-    ".tiktokcdn.com",
-    ".tiktokv.com",
-    "instagram.com",
-    ".cdninstagram.com",
-    ".fbcdn.net",
-    "x.com",
-    "twitter.com",
-    ".twimg.com",
-    "t.co",
-)
-
-
-def is_foreign_host(host):
-    host = (host or "").lower().rstrip(".")
-    return any(host == suffix.lstrip(".") or host.endswith(suffix) for suffix in FOREIGN_HOSTS)
 
 
 def proxy_url():
@@ -68,8 +48,15 @@ def proxy_url():
     return os.environ.get("https_proxy") or os.environ.get("http_proxy") or ""
 
 
-def proxy_endpoint():
-    url = proxy_url()
+def platform_proxy(platform):
+    if platform == "douyin":
+        return settings().douyin_proxy or None
+    if platform in FOREIGN_PLATFORMS:
+        return proxy_url() or None
+    return None
+
+
+def proxy_endpoint(url):
     if not url:
         return None
     parsed = urlsplit(url)
@@ -82,8 +69,19 @@ def emit(event, **data):
 
 def client(proxy=None):
     jar = http.cookiejar.MozillaCookieJar()
-    if settings().cookie_file:
-        jar.load(settings().cookie_file, ignore_discard=True, ignore_expires=False)
+    cookie_file = settings().cookie_file
+    if cookie_file:
+        try:
+            jar.load(Path(cookie_file).expanduser(), ignore_discard=True, ignore_expires=True)
+        except (OSError, UnicodeError):
+            raise AppError(
+                "COOKIE_CONFIG_INVALID", "服务的 Cookie 文件无法读取，请联系实例管理员检查配置。", 502
+            ) from None
+        for cookie in jar:
+            # Netscape exports may use zero for a session cookie.
+            if cookie.expires == 0:
+                cookie.expires, cookie.discard = None, True
+        jar.clear_expired_cookies()
     options = {
         "timeout": httpx.Timeout(20, connect=10),
         "follow_redirects": False,
@@ -96,7 +94,7 @@ def client(proxy=None):
     return httpx.Client(**options)
 
 
-def response(client_, url, method="GET", headers=None):
+def response(client_, url, method="GET", headers=None, *, allow_statuses=()):
     """Manual redirects, with credential/header stripping across origins."""
     headers = dict(headers or {})
     for _ in range(7):
@@ -110,7 +108,7 @@ def response(client_, url, method="GET", headers=None):
                 headers = {k: v for k, v in headers.items() if k.lower() not in ("authorization", "cookie")}
             url = target
             continue
-        if res.status_code >= 400:
+        if res.status_code >= 400 and res.status_code not in allow_statuses:
             res.close()
             raise AppError(
                 "SOURCE_EXPIRED" if res.status_code in (401, 403) else "UPSTREAM_CHANGED",
@@ -211,8 +209,36 @@ def permitted_format_url(url):
     return True
 
 
-def resolve_ytdlp(url, platform):
+def tiktok_extraction_error(error, proxied):
+    detail = str(error).lower()
+    if "log in" in detail or "login" in detail:
+        return AppError("AUTH_REQUIRED", "TikTok 要求登录后访问这条作品，请在原平台确认访问权限。", 422)
+    if proxied and any(term in detail for term in ("connection refused", "proxyerror", "tunnel connection failed")):
+        return AppError("NETWORK_TIMEOUT", "连接 TikTok 出口代理失败，请联系管理员检查代理是否可达。", 502, True)
+    if any(term in detail for term in (
+        "unexpected response from webpage request",
+        "unable to extract universal data for rehydration",
+        "unable to extract challenge data",
+        "unable to solve js challenge",
+        "your ip address is blocked",
+    )):
+        return AppError(
+            "ACCESS_DENIED",
+            "TikTok 未向当前服务出口返回视频数据，请在原平台确认作品可播放，或联系管理员检查 TikTok 出口。",
+            502,
+        )
+    return upstream_error(error)
+
+
+def resolve_ytdlp(url, platform, *, tiktok_cookies=None):
     cfg = settings()
+    cookiefile = None
+    if cfg.cookie_file:
+        try:
+            # yt-dlp writes its jar on close. Keep each job's updates in memory.
+            cookiefile = io.StringIO(Path(cfg.cookie_file).expanduser().read_text(encoding="utf-8"))
+        except (OSError, UnicodeError):
+            raise AppError("COOKIE_CONFIG_INVALID", "服务的 Cookie 文件无法读取，请联系实例管理员检查配置。", 502) from None
     opts = {
         "quiet": True,
         "no_warnings": True,
@@ -223,7 +249,7 @@ def resolve_ytdlp(url, platform):
         "retries": 1,
         "extractor_retries": 0,
         "cachedir": False,
-        "cookiefile": cfg.cookie_file or None,
+        "cookiefile": cookiefile,
         "js_runtimes": {"node": {}},
         "remote_components": [],
         "extract_flat": False,
@@ -233,6 +259,9 @@ def resolve_ytdlp(url, platform):
         opts["proxy"] = proxy_url() or ""
     else:
         opts["proxy"] = ""  # 国内平台保持直连,不走环境代理。
+    if platform == "tiktok":
+        # The default yt-dlp UA receives a maintenance page on some exits.
+        opts["http_headers"] = {"User-Agent": UA}
     with YoutubeDL(opts) as ydl:
         if platform == "bilibili":
             ydl.add_info_extractor(BiliBiliCDNIE())
@@ -241,7 +270,19 @@ def resolve_ytdlp(url, platform):
             if key != "Urllib":
                 handler = ydl._request_director.handlers.pop(key)
                 handler.close()
-        info = ydl.extract_info(url, download=False)
+        try:
+            info = ydl.extract_info(url, download=False)
+        except DownloadError as error:
+            if platform == "tiktok":
+                raise tiktok_extraction_error(error, bool(opts["proxy"])) from None
+            raise
+        if platform == "tiktok" and tiktok_cookies is not None:
+            # TikTok signs its CDN URLs for the originating web session. Keep its
+            # domain-scoped cookies in the current child, outside media metadata.
+            for cookie in ydl.cookiejar:
+                domain = cookie.domain.lstrip(".").lower()
+                if domain == "tiktok.com" or domain.endswith(".tiktok.com"):
+                    tiktok_cookies.set_cookie(copy(cookie))
     if not info or info.get("_type") in ("playlist", "multi_video") or info.get("is_live"):
         raise AppError("UNSUPPORTED", "当前版本只处理单个已发布视频，请使用具体作品链接。", 422)
     duration = info.get("duration")
@@ -297,10 +338,16 @@ def resolve_ytdlp(url, platform):
         if total > cfg.max_bytes:
             continue
         seen.add(bucket)
-        streams = [
-            {"url": f["url"], "headers": f.get("http_headers", info.get("http_headers", {}))}
-            for f in components
-        ]
+        streams = []
+        for component in components:
+            headers = component.get("http_headers", info.get("http_headers", {}))
+            if platform == "tiktok":
+                # Only the current download process's cookie jar may send credentials.
+                headers = {
+                    key: value for key, value in (headers or {}).items()
+                    if key.lower() not in ("cookie", "authorization")
+                }
+            streams.append({"url": component["url"], "headers": headers})
         ext = video.get("ext", "mp4")
         if len(components) > 1 and not (ext == "mp4" and components[1].get("ext") == "m4a"):
             ext = "mkv"
@@ -354,9 +401,7 @@ def resolve_direct(url):
     return data
 
 
-#: 小红书页面抓取的浏览器级请求头。
-#: 实测:携带 ``Accept-Encoding: identity`` 会被反爬判定为机器人,100% 302 到
-#: 登录页;补齐浏览器常规头后页面正常返回 `__INITIAL_STATE__` 数据。
+# 小红书分享页使用常规浏览器导航请求头。
 XHS_PAGE_HEADERS = {
     "User-Agent": UA,
     "Accept": (
@@ -372,43 +417,140 @@ XHS_PAGE_HEADERS = {
     "Upgrade-Insecure-Requests": "1",
     "Referer": "https://www.xiaohongshu.com/",
 }
+XHS_MOBILE_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 18_6 like Mac OS X) AppleWebKit/605.1.15 "
+        "(KHTML, like Gecko) Version/18.6 Mobile/15E148 Safari/604.1"
+    ),
+    "Accept": "text/html,application/xhtml+xml",
+    "Accept-Language": XHS_PAGE_HEADERS["Accept-Language"],
+    "Accept-Encoding": XHS_PAGE_HEADERS["Accept-Encoding"],
+}
+XHS_NOTE_PATH = re.compile(r"/(?:explore|discovery/item|user/profile/[^/]+)/([A-Za-z0-9]+)/?")
+XHS_INITIAL_STATE = re.compile(r"window\.__INITIAL_STATE__\s*=\s*(.*?)</script\s*>", re.DOTALL | re.IGNORECASE)
+XHS_STATE_TOKEN = re.compile(
+    r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|(?P<undefined>\bundefined\b)|(?P<empty_set>\bnew\s+Set\(\[\]\))'
+)
+XHS_FRESH_LINK = "请在小红书 App 中从原笔记重新复制完整分享链接。"
+
+
+def xhs_auth_required():
+    return AppError(
+        "AUTH_REQUIRED",
+        f"小红书要求登录后查看这条笔记。{XHS_FRESH_LINK}若仍受限，请由实例管理员配置本人的有效登录态。",
+        422,
+    )
+
+
+def xhs_initial_state(html):
+    match = XHS_INITIAL_STATE.search(html)
+    if match is None:
+        if html.strip().casefold() == "login required":
+            raise xhs_auth_required()
+        raise AppError("UPSTREAM_CHANGED", f"小红书未返回笔记页面数据。{XHS_FRESH_LINK}", 502, True)
+    # The page serializes missing values and empty Sets as JavaScript expressions.
+    # Normalize those literals without touching the title or other quoted fields.
+    replacements = {"undefined": "null", "empty_set": "[]"}
+    raw = XHS_STATE_TOKEN.sub(
+        lambda token: replacements.get(token.lastgroup, token[0]), match[1].strip().rstrip(";")
+    )
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        try:
+            return json5.loads(raw, consume_trailing=False)
+        except ValueError:
+            raise AppError("UPSTREAM_CHANGED", "小红书的笔记页面数据无法读取，请稍后重试。", 502, True) from None
+
+
+def xhs_landing_note(res, requested_url):
+    landing = urlsplit(str(res.url))
+    if res.status_code == 429:
+        raise AppError("RATE_LIMITED", "小红书暂时限制请求，请稍后再试。", 429, True)
+    host = (landing.hostname or "").lower().rstrip(".")
+    if not any(host == domain or host.endswith("." + domain) for domain in ("xiaohongshu.com", "rednote.com")):
+        raise AppError("INVALID_INPUT", f"小红书分享链接未进入笔记页面。{XHS_FRESH_LINK}", 422)
+    path = landing.path.rstrip("/")
+    if path == "/login" or path.startswith("/login/") or res.status_code == 401:
+        raise xhs_auth_required()
+    if res.status_code == 403 or path.startswith(("/captcha", "/verify", "/website-login")):
+        raise AppError("ACCESS_DENIED", f"小红书暂未允许访问这条笔记。{XHS_FRESH_LINK}", 422)
+    if res.status_code in (404, 410) or path == "/404" or path.startswith("/404/"):
+        raise AppError("NOT_FOUND", f"小红书未能打开这条笔记。{XHS_FRESH_LINK}", 422)
+    note = XHS_NOTE_PATH.fullmatch(path)
+    if note is None:
+        raise AppError("INVALID_INPUT", f"小红书分享链接未跳转到具体笔记。{XHS_FRESH_LINK}", 422)
+    requested_note = XHS_NOTE_PATH.fullmatch(urlsplit(requested_url).path)
+    if requested_note is not None and note[1] != requested_note[1]:
+        raise AppError("NOT_FOUND", f"小红书跳转到了另一条笔记。{XHS_FRESH_LINK}", 422)
+    return note[1]
+
+
+def xhs_note_page(url, page_headers):
+    with client() as c:
+        res = response(c, url, headers=page_headers, allow_statuses=(401, 403, 404, 410, 429))
+        try:
+            note_id = xhs_landing_note(res, url)
+        except AppError:
+            res.close()
+            raise
+        html = read_bounded(res).decode("utf-8", errors="replace")
+    state = xhs_initial_state(html)
+    try:
+        note = state["note"]["noteDetailMap"][note_id]["note"]
+    except (KeyError, TypeError):
+        note = None
+    if isinstance(note, dict) and note and note.get("noteId", note_id) == note_id:
+        return note, res.url, False
+    try:
+        note = state["noteData"]["data"]["noteData"]
+    except (KeyError, TypeError):
+        note = None
+    if isinstance(note, dict) and note.get("noteId") == note_id:
+        return note, res.url, True
+    raise AppError("UPSTREAM_CHANGED", f"小红书未返回所链接的笔记。{XHS_FRESH_LINK}", 502, True)
 
 
 def resolve_xhs(url):
-    with client() as c:
-        res = response(c, url, headers=XHS_PAGE_HEADERS)
-        html = read_bounded(res).decode("utf-8", errors="replace")
-    match = re.search(r"window\.__INITIAL_STATE__\s*=\s*(.*?)</script>", html, re.DOTALL)
-    if not match:
-        raise AppError(
-            "AUTH_REQUIRED", "小红书未返回作品信息。请重新复制完整分享链接，或配置本人的有效登录态。", 422
-        )
-    raw = match.group(1).strip().rstrip(";")
-    raw = re.sub(r'("(?:\\.|[^"\\])*"|\bundefined\b)', lambda m: "null" if m[0] == "undefined" else m[0], raw)
+    page_headers = XHS_PAGE_HEADERS
     try:
-        state = json5.loads(raw)
-        notes = state["note"]["noteDetailMap"]
-        note = next(entry["note"] for entry in notes.values() if entry.get("note", {}).get("video"))
-    except (ValueError, KeyError, StopIteration, TypeError):
-        raise AppError(
-            "UPSTREAM_CHANGED", "这条笔记未返回可用视频，可能是图文笔记或页面结构已调整。", 422
-        ) from None
-    video = note["video"]
+        note, landing, mobile_note = xhs_note_page(url, page_headers)
+    except AppError as error:
+        if error.code not in ("AUTH_REQUIRED", "UPSTREAM_CHANGED"):
+            raise
+        requested = httpx.URL(url)
+        signed_note = XHS_NOTE_PATH.fullmatch(requested.path) and requested.params.get("xsec_token")
+        share_link = requested.host.lower().rstrip(".") in (
+            "xhslink.com", "www.xhslink.com", "xhslink.cn", "www.xhslink.cn",
+        )
+        if not (signed_note or share_link):
+            raise
+        # RedNote can send desktop visitors to login while serving the same signed public note on mobile.
+        page_headers = {**XHS_MOBILE_HEADERS, "Referer": f"{requested.scheme}://{requested.netloc.decode()}/"}
+        note, landing, mobile_note = xhs_note_page(url, page_headers)
+    video = note.get("video")
+    if not isinstance(video, dict) or not video:
+        if note.get("type") == "normal":
+            raise AppError("UNSUPPORTED", "这是小红书图文笔记，请使用视频笔记的分享链接。", 422)
+        raise AppError("UNSUPPORTED_FORMAT", "小红书未提供这条笔记的可下载视频。", 422)
     images = note.get("imageList") or []
     cover_url = None
     if images:
         cover_url = images[0].get("urlDefault") or images[0].get("url")
+    author = note.get("user") or {}
     data = descriptor(
         url,
         "xiaohongshu",
         note.get("title") or note.get("desc"),
-        note.get("user", {}).get("nickname"),
+        author.get("nickname") or author.get("nickName"),
         thumbnail=cover_url,
         adapter="XHS SSR 1",
     )
-    origin = video.get("consumer", {}).get("originVideoKey")
-    headers = {"Referer": "https://www.xiaohongshu.com/", "User-Agent": UA}
-    if origin:
+    origin = (video.get("consumer") or {}).get("originVideoKey")
+    headers = {"Referer": f"{landing.scheme}://{landing.netloc.decode()}/", "User-Agent": page_headers["User-Agent"]}
+    # Mobile detail pages can include an origin key whose synthesized CDN URL rejects downloads.
+    # Use the signed renditions the mobile page actually exposes.
+    if origin and not mobile_note:
         add_format(
             data,
             "origin",
@@ -416,10 +558,12 @@ def resolve_xhs(url):
             watermark="absent",
             quality="无水印原流",
         )
-    streams = video.get("media", {}).get("stream", {})
-    for codec, variants in streams.items():
-        for variant in variants[:6]:
-            address = variant.get("masterUrl") or next(iter(variant.get("backupUrls", [])), None)
+    streams = (video.get("media") or {}).get("stream") or {}
+    codecs = sorted(streams, key=lambda codec: codec != "h264") if mobile_note else streams
+    for codec in codecs:
+        for variant in streams[codec][:6]:
+            addresses = [variant.get("masterUrl"), *(variant.get("backupUrls") or [])]
+            address = next((address for address in addresses if permitted_format_url(address)), None)
             if address:
                 add_format(
                     data,
@@ -433,7 +577,97 @@ def resolve_xhs(url):
     return data
 
 
-def resolve_ks(url):
+KUAISHOU_MOBILE_UA = (
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) AppleWebKit/605.1.15 "
+    "(KHTML, like Gecko) Version/18.5 Mobile/15E148 Safari/604.1"
+)
+# Existing tasks use the ID generated from the guest source key.
+KUAISHOU_GUEST_FORMAT_ID = hashlib.sha256(b"source").hexdigest()[:20]
+
+
+def ks_video(url, work, address, headers, adapter, *, duration=None, mobile_photo=None):
+    author = work.get("author")
+    poster = work.get("poster")
+    width, height = work.get("width"), work.get("height")
+    if not (type(width) is int and width > 0 and type(height) is int and height > 0):
+        width, height = None, None
+    data = descriptor(
+        url,
+        "kuaishou",
+        work.get("caption") or work.get("title"),
+        work.get("userName") or (author.get("name") if isinstance(author, dict) else None),
+        duration=duration,
+        thumbnail=poster if permitted_format_url(poster) else None,
+        adapter=adapter,
+    )
+    key = "source"
+    quality = None
+    if mobile_photo:
+        key = f"mobile:{mobile_photo}"
+        quality = f"移动网页 · {min(width, height)}p" if width and height else "移动网页"
+    add_format(data, key, [{"url": address, "headers": headers}], width=width, height=height, quality=quality)
+    return data
+
+
+def resolve_ks_mobile(url, photo=None):
+    headers = {"User-Agent": KUAISHOU_MOBILE_UA}
+    try:
+        with client() as c:
+            res = response(c, url, headers=headers)
+            landing = urlsplit(str(res.url))
+            host = landing.hostname or ""
+            work_path = re.fullmatch(r"/fw/photo/([A-Za-z0-9_-]+)/?", landing.path)
+            platform_host = any(
+                host == domain or host.endswith("." + domain) for domain in PLATFORMS["kuaishou"][1]
+            )
+            if not work_path or not platform_host or (photo is not None and work_path[1] != photo):
+                res.close()
+                return None
+            photo = work_path[1]
+            html = read_bounded(res).decode("utf-8", errors="replace")
+        state_match = re.search(r"window\.INIT_STATE\s*=\s*", html)
+        if not state_match:
+            return None
+        state, _ = json.JSONDecoder().raw_decode(html, state_match.end())
+    except (AppError, httpx.HTTPError, OSError, ValueError):
+        return None
+    if not isinstance(state, dict):
+        return None
+
+    for entry in state.values():
+        work = entry.get("photo") if isinstance(entry, dict) else None
+        if not isinstance(work, dict) or not isinstance(work.get("mainMvUrls"), list):
+            continue
+        for media in work["mainMvUrls"]:
+            address = media.get("url") if isinstance(media, dict) else None
+            if not permitted_format_url(address):
+                continue
+            source = urlsplit(address)
+            # The mobile page's photoId is internal. The CDN cache key identifies the public work.
+            cache_key = (parse_qs(source.query).get("clientCacheKey") or [""])[0]
+            if not re.fullmatch(re.escape(photo) + r"(?:_[A-Za-z0-9-]+)?\.mp4", cache_key):
+                continue
+            cdn_host = source.hostname or ""
+            if not cdn_host.endswith((".kwimgs.com", ".kwaicdn.com")):
+                continue
+            duration_ms = work.get("duration")
+            duration = duration_ms / 1000 if type(duration_ms) is int and duration_ms > 0 else None
+            covers = work.get("coverUrls")
+            if isinstance(covers, list) and covers and isinstance(covers[0], dict):
+                work = work | {"poster": covers[0].get("url")}
+            headers["Referer"] = f"{landing.scheme}://{landing.netloc}/"
+            return ks_video(
+                url, work, address, headers, "Kuaishou mobile SSR", duration=duration, mobile_photo=photo
+            )
+    return None
+
+
+def resolve_ks(url, format_id=None):
+    if format_id is not None and format_id != KUAISHOU_GUEST_FORMAT_ID:
+        mobile = resolve_ks_mobile(url)
+        if mobile is None:
+            raise AppError("SOURCE_CHANGED", "快手移动网页视频源暂时不可用，请重新解析。", 409)
+        return mobile
     with client() as c:
         c.cookies.set("did", "web_" + os.urandom(10).hex(), domain=".kuaishou.com")
         res = response(c, url)
@@ -442,9 +676,9 @@ def resolve_ks(url):
         query = parse_qs(urlsplit(landing).query)
         photo = (query.get("photoId") or [None])[0]
         if not photo:
-            match = re.search(r"/short-video/([A-Za-z0-9_-]+)", landing)
+            match = re.search(r"/(?:short-video|fw/photo)/([A-Za-z0-9_-]+)", urlsplit(landing).path)
             photo = match[1] if match else None
-        principal = (query.get("userId") or query.get("principalId") or [None])[0]
+        principal = (query.get("userId") or query.get("principalId") or query.get("authorId") or [None])[0]
         if not principal:
             match = re.search(r'"(?:userId|principalId)"\s*:\s*"([A-Za-z0-9_-]+)"', html)
             principal = match[1] if match else None
@@ -457,31 +691,36 @@ def resolve_ks(url):
         body = json.loads(
             read_bounded(response(c, str(endpoint), headers={"Referer": "https://live.kuaishou.com/"}))
         )
-    work = (body.get("data") or {}).get("currentWork") or {}
-    address = work.get("mp4Url") or work.get("photoUrl")
+    feed = body.get("data") if isinstance(body, dict) else None
+    work = feed.get("currentWork") if isinstance(feed, dict) else None
+    work = work if isinstance(work, dict) else {}
     extra = work.get("ext_params") or {}
     if isinstance(extra, str):
         try:
             extra = json.loads(extra)
         except ValueError:
             extra = {}
-    address = address or extra.get("mp4Url")
-    if not address or not str(address).startswith(("http://", "https://")):
+    candidates = (
+        work.get("mp4Url"),
+        work.get("playUrl"),
+        work.get("photoUrl"),
+        extra.get("mp4Url") if isinstance(extra, dict) else None,
+    )
+    address = next((url for url in candidates if permitted_format_url(url)), None)
+    if address is None:
+        if format_id == KUAISHOU_GUEST_FORMAT_ID:
+            raise AppError("SOURCE_CHANGED", "快手游客视频源已变化，请重新解析后选择可用版本。", 409)
+        fallback = resolve_ks_mobile(url, photo)
+        if fallback is not None:
+            return fallback
         raise AppError("ACCESS_DENIED", "快手未返回可用视频。请使用新分享链接，或稍后再试。", 422)
-    data = descriptor(
+    return ks_video(
         url,
-        "kuaishou",
-        work.get("caption") or work.get("title"),
-        work.get("userName"),
-        adapter="Kuaishou guest 1",
+        work,
+        address,
+        {"Referer": "https://live.kuaishou.com/", "User-Agent": UA},
+        "Kuaishou guest 2",
     )
-    # A field called mp4Url alone is not proof of a watermark-free asset.
-    add_format(
-        data,
-        "source",
-        [{"url": address, "headers": {"Referer": "https://live.kuaishou.com/", "User-Agent": UA}}],
-    )
-    return data
 
 
 def dtk_fetch(url):
@@ -556,20 +795,22 @@ def resolve_dtk(url, platform, content):
     return data
 
 
-def resolve(url, platform, dtk=None, douyin_identity=None):
+def resolve(url, platform, dtk=None, douyin_identity=None, *, tiktok_cookies=None, format_id=None):
     safe_url(url)
     if platform == "direct":
         data = resolve_direct(url)
     elif platform == "xiaohongshu":
         data = resolve_xhs(url)
     elif platform == "kuaishou":
-        data = resolve_ks(url)
+        data = resolve_ks(url, format_id)
     elif platform == "douyin" and dtk is not None:
         data = resolve_dtk(url, platform, dtk)
     elif platform == "douyin":
         data = resolve_douyin(url, douyin_identity)
     elif dtk is not None:
         data = resolve_dtk(url, platform, dtk)
+    elif platform == "tiktok":
+        data = resolve_ytdlp(url, platform, tiktok_cookies=tiktok_cookies)
     else:
         data = resolve_ytdlp(url, platform)
     if not data["public"]["formats"]:
@@ -641,7 +882,7 @@ def load_or_mint_douyin_identity(url: str) -> dict[str, str]:
         if path.exists():
             cached = json.loads(path.read_text())
             cookies = cached.get("cookies") or {}
-            if cached.get("expires", 0) > now and cookies.get("ttwid"):
+            if cached.get("expires", 0) > now and cookies.get("ttwid") and (cookies.get("UIFID_TEMP") or cookies.get("UIFID")):
                 return cookies
     except (OSError, ValueError):
         pass
@@ -699,7 +940,7 @@ def douyin_signed_detail_url(aweme_id: str, identity: dict[str, str]) -> tuple[s
 def resolve_douyin(url: str, identity: dict[str, str] | None):
     if not identity:
         raise AppError("UPSTREAM_CHANGED", "抖音访客身份不可用,请稍后重试。", 502, True)
-    with client() as c:
+    with client(proxy=settings().douyin_proxy or None) as c:
         res = response(c, url)
         landing = str(res.url)
         html = read_bounded(res).decode("utf-8", errors="replace")
@@ -714,7 +955,7 @@ def resolve_douyin(url: str, identity: dict[str, str] | None):
         raise AppError("INVALID_INPUT", "未识别到抖音作品 ID,请重新复制完整分享链接。", 422)
 
     detail_url, headers = douyin_signed_detail_url(aweme_id, identity)
-    with client() as c:
+    with client(proxy=settings().douyin_proxy or None) as c:
         res = response(c, detail_url, headers=headers)
         body = read_bounded(res).decode("utf-8", errors="replace")
     try:
@@ -782,7 +1023,7 @@ def cover(data, directory):
     url = data["private"].pop("thumbnail", None)
     if not url:
         return
-    proxy = proxy_url() if is_foreign_host(urlsplit(url).hostname) else None
+    proxy = platform_proxy(data["public"]["platform"])
     try:
         with client(proxy=proxy) as c:
             res = response(c, url)
@@ -811,18 +1052,16 @@ def media_container(path):
     raise AppError("MEDIA_INVALID", "来源未返回受支持的视频文件，无法保存。", 422)
 
 
-def download(data, fmt_id, directory):
+def download(data, fmt_id, directory, *, tiktok_cookies=None):
     fmt = next((f for f in data["public"]["formats"] if f["id"] == fmt_id), None)
     if not fmt:
         raise AppError("SOURCE_CHANGED", "可用画质发生变化，请重新解析后选择。", 409)
     components = data["private"]["formats"][fmt_id]
-    proxy = (
-        proxy_url()
-        if any(is_foreign_host(urlsplit(stream["url"]).hostname) for stream in components)
-        else None
-    )
+    proxy = platform_proxy(data["public"]["platform"])
     paths, received, started, last_event = [], 0, time.monotonic(), 0
     with client(proxy=proxy) as c:
+        if tiktok_cookies is not None:
+            c.cookies.update(tiktok_cookies)
         for index, stream in enumerate(components):
             res = response(c, stream["url"], headers=stream.get("headers"))
             total = int(res.headers.get("content-length", "0")) or None
@@ -957,8 +1196,15 @@ def main():
     douyin_identity = None
     if platform == "douyin" and dtk is None:
         douyin_identity = load_or_mint_douyin_identity(url)
-    install_network_guard(proxy_endpoint())
-    data = resolve(url, platform, dtk, douyin_identity)
+    install_network_guard(proxy_endpoint(platform_proxy(platform)))
+    tiktok_cookies = (
+        http.cookiejar.CookieJar()
+        if platform == "tiktok" and dtk is None and command["mode"] == "download"
+        else None
+    )
+    data = resolve(
+        url, platform, dtk, douyin_identity, tiktok_cookies=tiktok_cookies, format_id=command.get("format_id")
+    )
     if command["mode"] == "resolve":
         cover(data, directory)
         emit("result", data=data)
@@ -967,7 +1213,7 @@ def main():
         fmt = next((f for f in data["public"]["formats"] if f["id"] == command["format_id"]), None)
         if not fmt or (previous == "absent" and fmt["watermark"] != "absent"):
             raise AppError("SOURCE_CHANGED", "视频版本已变化，请重新解析确认画质和水印状态。", 409)
-        emit("result", data=download(data, command["format_id"], directory))
+        emit("result", data=download(data, command["format_id"], directory, tiktok_cookies=tiktok_cookies))
 
 
 if __name__ == "__main__":

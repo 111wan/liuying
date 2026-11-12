@@ -1,9 +1,0 @@
-allowBuilds:
-  esbuild: true
-
-peerDependencyRules:
-  ignoreMissing:
-    - '@algolia/client-search'
-    - react
-    - react-dom
-    - '@types/react'

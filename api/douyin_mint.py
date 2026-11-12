@@ -28,6 +28,8 @@ from typing import Any
 
 import websockets
 
+from .config import settings
+
 CHROME_CANDIDATES = (
     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
     "/Applications/Chromium.app/Contents/MacOS/Chromium",
@@ -49,11 +51,18 @@ WANTED_COOKIES = (
     "sid_guard",
 )
 
-MINT_TIMEOUT_SECONDS = 40
+MINT_TIMEOUT_SECONDS = 55
 
 
 class MintError(RuntimeError):
     """无法铸造抖音访客身份。"""
+
+
+def _read_cdp_version(port: int) -> dict[str, Any]:
+    """Read Chrome's local CDP endpoint without inheriting system proxies."""
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    with opener.open(f"http://127.0.0.1:{port}/json/version", timeout=1) as response:
+        return json.loads(response.read())
 
 
 def find_chrome() -> str | None:
@@ -74,14 +83,7 @@ def _mint(port: int, target_url: str, proc: subprocess.Popen) -> dict[str, str]:
             if proc.poll() is not None:
                 raise MintError(f"Chrome 提前退出(exit {proc.returncode})")
             try:
-
-                def read_version():
-                    with urllib.request.urlopen(
-                        f"http://127.0.0.1:{port}/json/version", timeout=1
-                    ) as response:
-                        return json.loads(response.read())
-
-                version = await asyncio.to_thread(read_version)
+                version = await asyncio.to_thread(_read_cdp_version, port)
             except Exception:  # noqa: BLE001 -- 端口未就绪,继续等
                 await asyncio.sleep(0.5)
         if version is None:
@@ -102,11 +104,11 @@ def _mint(port: int, target_url: str, proc: subprocess.Popen) -> dict[str, str]:
                     message["sessionId"] = session
                 await ws.send(json.dumps(message))
                 while True:
-                    reply = json.loads(await asyncio.wait_for(ws.recv(), timeout=25))
+                    reply = json.loads(await asyncio.wait_for(ws.recv(), timeout=max(0.1, deadline - time.monotonic())))
                     if reply.get("id") == seq:
                         return reply
 
-            created = await call("Target.createTarget", {"url": target_url})
+            created = await call("Target.createTarget", {"url": "about:blank"})
             attached = await call(
                 "Target.attachToTarget",
                 {"targetId": created["result"]["targetId"], "flatten": True},
@@ -115,12 +117,16 @@ def _mint(port: int, target_url: str, proc: subprocess.Popen) -> dict[str, str]:
             await call("Page.enable", session=session)
             await call("Network.enable", session=session)
 
+            # Navigation may wait on redirects; poll cookies while it is in flight.
+            seq += 1
+            await ws.send(json.dumps({"id": seq, "method": "Page.navigate",
+                                      "params": {"url": target_url}, "sessionId": session}))
             cookies: dict[str, str] = {}
-            for _ in range(12):
-                await asyncio.sleep(2)
+            while time.monotonic() < deadline:
+                await asyncio.sleep(min(1, max(0, deadline - time.monotonic())))
                 reply = await call("Network.getAllCookies", session=session)
                 for cookie in reply["result"]["cookies"]:
-                    if cookie["domain"].endswith("douyin.com"):
+                    if cookie["domain"].lstrip(".") == "douyin.com" or cookie["domain"].endswith(".douyin.com"):
                         cookies[cookie["name"]] = cookie["value"]
                 if cookies.get("ttwid") and (
                     cookies.get("UIFID_TEMP") or cookies.get("UIFID")
@@ -147,15 +153,13 @@ def mint_identity(target_url: str) -> dict[str, str]:
         [
             binary,
             "--headless=new",
+            *(["--proxy-server=" + settings().douyin_proxy] if settings().douyin_proxy else []),
             "--no-sandbox",
-            "--disable-gpu",
-            "--disable-software-rasterizer",
             "--disable-dev-shm-usage",
             f"--remote-debugging-port={port}",
             f"--user-data-dir={profile}",
             "--no-first-run",
             "--no-default-browser-check",
-            "--disable-background-networking",
             "--mute-audio",
             "about:blank",
         ],
@@ -165,15 +169,22 @@ def mint_identity(target_url: str) -> dict[str, str]:
     )
     try:
         cookies = _mint(port, target_url, proc)
+    except (TimeoutError, OSError, websockets.exceptions.WebSocketException) as error:
+        raise MintError("浏览器连接超时或中断，请重试") from error
     finally:
         try:
             proc.terminate()
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             proc.kill()
+            proc.wait(timeout=5)
         shutil.rmtree(profile, ignore_errors=True)
     wanted = {name: cookies[name] for name in WANTED_COOKIES if name in cookies}
     if not wanted.get("ttwid") or not (wanted.get("UIFID_TEMP") or wanted.get("UIFID")):
+        if not cookies:
+            raise MintError(
+                "抖音页面未能加载,代理可能不可达。请检查 LIUYING_DOUYIN_PROXY 是否可达,或留空改为直连。"
+            )
         raise MintError("页面未生成 uifid/ttwid,铸造失败")
     return wanted
 

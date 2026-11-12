@@ -36,11 +36,16 @@ def test_share_text():
     )
     signed = "https://www.xiaohongshu.com/explore/123?xsec_token=secret&xsec_source=share"
     assert extract_url(signed) == (signed, "xiaohongshu")
+    assert extract_url("https://www.rednote.com/explore/123") == (
+        "https://www.rednote.com/explore/123", "xiaohongshu"
+    )
+    assert extract_url("https://xhslink.cn/abc") == ("https://xhslink.cn/abc", "xiaohongshu")
 
 
 def test_platform_boundaries_and_multiple_links():
     for text in [
         "https://douyin.com.evil.example/watch",
+        "https://rednote.com.evil.example/explore/123",
         "https://a.example/x.mp4 https://b.example/x.mp4",
         "hello",
     ]:

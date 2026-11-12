@@ -115,6 +115,8 @@ function App() {
   const format = media?.formats.find((f) => f.id === selected);
   const resolving = submitting || (!!resolveId && !terminal(resolveJob));
   const processing = busy || (!!downloadId && !terminal(downloadJob));
+  const sourceToReparse =
+    downloadJob?.error?.code === "SOURCE_CHANGED" ? resolveJob : null;
   const ready =
     downloadJob?.status === "ready" &&
     !!downloadJob.result?.artifact_id &&
@@ -671,7 +673,11 @@ function App() {
                           <button
                             className="primary"
                             disabled={processing || !format}
-                            onClick={prepare}
+                            onClick={
+                              sourceToReparse
+                                ? () => retry(sourceToReparse)
+                                : prepare
+                            }
                           >
                             {processing ? (
                               <LoaderCircle className="spin" size={17} />
@@ -680,13 +686,15 @@ function App() {
                             )}{" "}
                             {processing
                               ? "正在准备文件"
-                              : downloadJob?.status === "failed"
-                                ? "重新准备"
-                                : format?.watermark === "absent"
-                                  ? "准备无水印版本"
-                                  : format?.watermark === "present"
-                                    ? "准备带水印版本"
-                                    : "准备下载"}
+                              : sourceToReparse
+                                ? "重新解析"
+                                : downloadJob?.status === "failed"
+                                  ? "重新准备"
+                                  : format?.watermark === "absent"
+                                    ? "准备无水印版本"
+                                    : format?.watermark === "present"
+                                      ? "准备带水印版本"
+                                      : "准备下载"}
                           </button>
                         )}
                         {processing && downloadJob && (

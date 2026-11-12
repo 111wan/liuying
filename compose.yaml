@@ -1,15 +1,21 @@
 # Local production-style topology. No database/Redis port is exposed to the host.
 name: liuying
 x-app: &app
+  init: true
   build: .
   environment: &env
     LIUYING_DATA_DIR: /data
     LIUYING_DATABASE_URL: postgresql+psycopg://liuying:${LIUYING_DB_PASSWORD:-liuying-local-only}@db:5432/liuying
     LIUYING_QUEUE_MODE: celery
     LIUYING_REDIS_URL: redis://redis:6379/0
+    LIUYING_ACCESS_PASSWORD: ${LIUYING_ACCESS_PASSWORD:-}
+    LIUYING_SECURE_COOKIE: ${LIUYING_SECURE_COOKIE:-true}
+    LIUYING_ALLOWED_HOSTS: ${LIUYING_ALLOWED_HOSTS:?Set LIUYING_ALLOWED_HOSTS in .env}
+    LIUYING_DOUYIN_PROXY: ${LIUYING_DOUYIN_PROXY:-}
+    LIUYING_PROXY: ${LIUYING_PROXY:-}
+    LIUYING_COOKIE_FILE: ${LIUYING_COOKIE_FILE:-}
     LIUYING_DTK_URL: ${LIUYING_DTK_URL:-}
     LIUYING_DTK_API_KEY: ${LIUYING_DTK_API_KEY:-}
-    LIUYING_ALLOWED_HOSTS: '["127.0.0.1","localhost"]'
   volumes:
     - media:/data
   restart: unless-stopped
@@ -22,8 +28,11 @@ x-app: &app
 services:
   api:
     <<: *app
+    environment:
+      <<: *env
+      FORWARDED_ALLOW_IPS: ${LIUYING_FORWARDED_ALLOW_IPS:-127.0.0.1,::1}
     ports:
-      - "127.0.0.1:8000:8000"
+      - "127.0.0.1:18000:8000"
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health', timeout=3)"]
       interval: 15s
